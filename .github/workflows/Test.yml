@@ -23,17 +23,13 @@ jobs:
         ECR_RESISTRY: ${{ steps.ecr-login.outputs.registry }}
         ECR_REPOSITORY: distributed-programming-ex
       run: docker pull $ECR_RESISTRY/$ECR_REPOSITORY:latest
-    - name: Copy project dir
-      run: |
-        cp -r $(pwd) /tmp/work
-        chown -R 1001:115 /tmp/work
     - name: Build mochi-intro
       env:
         ECR_RESISTRY: ${{ steps.ecr-login.outputs.registry }}
         ECR_REPOSITORY: distributed-programming-ex
       run: >-
         docker run
-        --mount type=bind,source=/tmp/work,target=/work
+        --mount type=bind,source=$(pwd),target=/work
         -t $ECR_RESISTRY/$ECR_REPOSITORY:latest /work/mochi-intro/ci.sh
     - name: Build ring
       env:
@@ -41,5 +37,5 @@ jobs:
         ECR_REPOSITORY: distributed-programming-ex
       run: >-
         docker run
-        --mount type=bind,source=/tmp/work,target=/work
+        --mount type=bind,source=$(pwd),target=/work
         -t $ECR_RESISTRY/$ECR_REPOSITORY:latest /work/ring/ci.sh
