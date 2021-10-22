@@ -28,5 +28,5 @@ jobs:
         DOKCER_BUILDKIT: 1
       run: |
         docker pull $ECR_RESISTRY/$ECR_REPOSITORY:latest || true
-        docker build -t $ECR_RESISTRY/$ECR_REPOSITORY:latest --cache-from=$ECR_RESISTRY/$ECR_REPOSITORY --build-arg BUILDKIT_INLINE_CACHE=1 .
+        docker build -t $ECR_RESISTRY/$ECR_REPOSITORY:latest --cache-from=$ECR_RESISTRY/$ECR_REPOSITORY --build-arg BUILDKIT_INLINE_CACHE=1 UID=1001 GID=115 .
         docker push $ECR_RESISTRY/$ECR_REPOSITORY:latest
