@@ -26,5 +26,5 @@ jobs:
     - name: Build mochi-intro
       run: >-
         docker run
-        --mount type=bind,source=$(pwd),dist=/work
+        --mount type=bind,source=$(pwd),target=/work
         -t $ECR_RESISTRY/$ECR_REPOSITORY:latest /bin/sh /work/mochi-intro/ci.sh
