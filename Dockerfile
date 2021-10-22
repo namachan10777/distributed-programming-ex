@@ -5,7 +5,7 @@ ARG GID=1000
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
-    git python3 gcc g++ meson \
+    git python3 gcc g++ meson clang-format \
     cmake=3.16.3-1ubuntu1 \
     pkgconf=1.6.3-5 \
     autoconf=2.69-11.1 \
