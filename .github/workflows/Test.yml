@@ -31,3 +31,11 @@ jobs:
         docker run
         --mount type=bind,source=$(pwd),target=/work
         -t $ECR_RESISTRY/$ECR_REPOSITORY:latest /work/mochi-intro/ci.sh
+    - name: Build ring
+      env:
+        ECR_RESISTRY: ${{ steps.ecr-login.outputs.registry }}
+        ECR_REPOSITORY: distributed-programming-ex
+      run: >-
+        docker run
+        --mount type=bind,source=$(pwd),target=/work
+        -t $ECR_RESISTRY/$ECR_REPOSITORY:latest /work/ring/ci.sh
