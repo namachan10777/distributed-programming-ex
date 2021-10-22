@@ -28,4 +28,4 @@ jobs:
       run: |
         docker pull $ECR_RESISTRY/$ECR_REPOSITORY:latest || true
         docker build -t $ECR_RESISTRY/$ECR_REPOSITORY:latest --cache-from=$ECR_RESISTRY/$ECR_REPOSITORY --build-arg BUILDKIT_INLINE_CACHE=1 .
-        docker push $ECR_RESITORY/$ECR_REPOSITORY:latest
+        docker push $ECR_RESISTRY/$ECR_REPOSITORY:latest
