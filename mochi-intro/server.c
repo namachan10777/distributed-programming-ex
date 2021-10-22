@@ -7,7 +7,7 @@ static void put(hg_handle_t h);
 DECLARE_MARGO_RPC_HANDLER(put)
 
 int
-main(int argc, char *argv[])
+main()
 {
         margo_instance_id mid;
         char addr_str[PATH_MAX];
