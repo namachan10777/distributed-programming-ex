@@ -9,12 +9,14 @@
 
 ```
 spack load mochi-margo
-bear -- make
+meson build
+bear -- ninja -C ./build
 ```
 
 ## Build
 
 ```
 spack load mochi-margo
-make
+meson build
+ninja -C ./build
 ```
