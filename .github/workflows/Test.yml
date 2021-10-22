@@ -24,7 +24,10 @@ jobs:
         ECR_REPOSITORY: distributed-programming-ex
       run: docker pull $ECR_RESISTRY/$ECR_REPOSITORY:latest
     - name: Build mochi-intro
+      env:
+        ECR_RESISTRY: ${{ steps.ecr-login.outputs.registry }}
+        ECR_REPOSITORY: distributed-programming-ex
       run: >-
         docker run
         --mount type=bind,source=$(pwd),target=/work
-        -t $ECR_RESISTRY/$ECR_REPOSITORY:latest /bin/sh /work/mochi-intro/ci.sh
+        -t $ECR_RESISTRY/$ECR_REPOSITORY:latest /work/mochi-intro/ci.sh
