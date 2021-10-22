@@ -25,6 +25,7 @@ jobs:
       env:
         ECR_RESISTRY: ${{ steps.ecr-login.outputs.registry }}
         ECR_REPOSITORY: distributed-programming-ex
+        DOKCER_BUILDKIT: 1
       run: |
         docker pull $ECR_RESISTRY/$ECR_REPOSITORY:latest || true
         docker build -t $ECR_RESISTRY/$ECR_REPOSITORY:latest --cache-from=$ECR_RESISTRY/$ECR_REPOSITORY --build-arg BUILDKIT_INLINE_CACHE=1 .
