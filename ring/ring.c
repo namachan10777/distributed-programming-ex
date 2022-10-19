@@ -1,3 +1,4 @@
+#include "abt.h"
 #include "margo-logging.h"
 #include "mercury_macros.h"
 #include <assert.h>
@@ -19,6 +20,8 @@ DECLARE_MARGO_RPC_HANDLER(join)
 DECLARE_MARGO_RPC_HANDLER(set_next)
 DECLARE_MARGO_RPC_HANDLER(set_prev)
 static hg_return_t join_ring(hg_string_t _addr);
+
+ABT_mutex join_lock;
 
 static struct {
   margo_instance_id mid;
@@ -46,6 +49,8 @@ int main(int argc, char *argv[]) {
   char addr_str[PATH_MAX];
 
   printf("initializing server\n");
+
+  ABT_mutex_create(&join_lock);
 
   env.mid = margo_init("tcp", MARGO_SERVER_MODE, 1, 10);
   assert(env.mid);
@@ -144,6 +149,7 @@ err:
 }
 
 static void join(hg_handle_t h) {
+  ABT_mutex_lock(join_lock);
   hg_return_t ret;
   char *joined_addr_str;
   printf("enter join_rcp handler\n");
@@ -188,6 +194,7 @@ static void join(hg_handle_t h) {
   if ((ret = margo_destroy(h)) != HG_SUCCESS) {
     goto exit;
   }
+  ABT_mutex_unlock(join_lock);
   return;
 err_prev:
   margo_destroy(prev_h);
