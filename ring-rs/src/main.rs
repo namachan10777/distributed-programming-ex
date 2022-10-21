@@ -34,11 +34,12 @@ struct Ring {
     me: SocketAddr,
     am_i_coordinator: Arc<RwLock<bool>>,
     connection: Arc<RwLock<Connection>>,
+    ring_cache: Arc<RwLock<Vec<String>>>,
     notify_recieved_list_rpc: tokio::sync::mpsc::Sender<CooridnatorEvent>,
 }
 
 impl Ring {
-    async fn join_impl(&self, new_prev: &str) -> anyhow::Result<String> {
+    async fn join_impl_no_rollback(&self, new_prev: &str) -> anyhow::Result<()> {
         let new_prev = new_prev.parse()?;
         let old_prev = {
             let mut connection = self.connection.write().await;
@@ -56,7 +57,104 @@ impl Ring {
         if let Some(err_msg) = set_next_response.into_inner().err_msg {
             return Err(anyhow::anyhow!("{}", err_msg));
         }
-        Ok(old_prev.to_string())
+        Ok(())
+    }
+
+    async fn join_impl(&self, new_prev: &str) -> anyhow::Result<String> {
+        let old_prev = self.connection.read().await.prev;
+        match self.join_impl_no_rollback(new_prev).await {
+            Ok(()) => Ok(old_prev.to_string()),
+            Err(e) => {
+                self.connection.write().await.prev = old_prev;
+                Err(e)
+            }
+        }
+    }
+
+    async fn relay_list_rpc_in_background(&self, mut addresses: Vec<String>) {
+        let connection = self.connection.clone();
+        let me = self.me;
+        tokio::spawn(async move {
+            if let Ok(mut client) =
+                RingClient::connect(format!("http://{}", connection.read().await.prev)).await
+            {
+                addresses.push(me.to_string());
+                if let Err(e) = client.list(ListRequest { addresses }).await {
+                    warn!("{}.list responses {}", connection.read().await.prev, e);
+                }
+            }
+        });
+    }
+
+    async fn relay_election_rpc_in_background(&self, mut addresses: Vec<String>) {
+        let connection = self.connection.clone();
+        let me = self.me;
+        tokio::spawn(async move {
+            if let Ok(mut client) =
+                RingClient::connect(format!("http://{}", connection.read().await.prev)).await
+            {
+                addresses.push(me.to_string());
+                if let Err(e) = client.election(ListRequest { addresses }).await {
+                    warn!("{}.list responses {}", connection.read().await.prev, e);
+                }
+            }
+        });
+    }
+
+    async fn relay_coordinate_rpc_in_background(
+        &self,
+        addresses: Vec<String>,
+        mut read: Vec<String>,
+    ) {
+        let connection = self.connection.clone();
+        let me = self.me;
+        tokio::spawn(async move {
+            match RingClient::connect(format!("http://{}", connection.read().await.prev)).await {
+                Ok(mut client) => {
+                    read.push(me.to_string());
+                    if let Err(e) = client
+                        .coordinate(CoordinateRequest { addresses, read })
+                        .await
+                    {
+                        warn!(
+                            "{}.coordinate responses {}",
+                            connection.read().await.prev,
+                            e
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "{}.coordinate responses {}",
+                        connection.read().await.prev,
+                        e
+                    );
+                }
+            }
+        });
+    }
+
+    async fn announce_in_background(&self, addresses: Vec<String>) {
+        info!("members: {:?}", addresses);
+        tokio::spawn(async move {
+            for address in &addresses {
+                match RingClient::connect(format!("http://{}", address)).await {
+                    Ok(mut client) => {
+                        if let Err(e) = client
+                            .connection_announce(ListRequest {
+                                addresses: addresses.clone(),
+                            })
+                            .await
+                        {
+                            warn!("{}.connection_announce responses {}", address, e);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("failde to connect {} due to {}", address, e);
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -118,7 +216,7 @@ impl proto::ring_server::Ring for Ring {
     }
 
     async fn list(&self, request: Request<ListRequest>) -> Result<Response<Empty>, Status> {
-        let mut addresses = request.into_inner().addresses;
+        let addresses = request.into_inner().addresses;
 
         if let Err(e) = self
             .notify_recieved_list_rpc
@@ -130,106 +228,46 @@ impl proto::ring_server::Ring for Ring {
         }
         if !addresses.contains(&self.me.to_string()) {
             // TODO: Error handling
-            // TODO: request to next in background
-            if let Ok(mut client) =
-                RingClient::connect(format!("http://{}", self.connection.read().await.prev)).await
-            {
-                addresses.push(self.me.to_string());
-                if let Err(e) = client.list(ListRequest { addresses }).await {
-                    warn!("{}.list responses {}", self.connection.read().await.prev, e);
-                }
-            }
+            self.relay_list_rpc_in_background(addresses).await;
         } else {
-            info!("members: {:?}", addresses);
+            self.announce_in_background(addresses).await;
         }
         Ok(Response::new(Empty {}))
     }
+
     async fn coordinate(
         &self,
         request: Request<CoordinateRequest>,
     ) -> Result<Response<Empty>, Status> {
-        let CoordinateRequest {
-            addresses,
-            mut read,
-        } = request.into_inner();
+        let CoordinateRequest { addresses, read } = request.into_inner();
         *self.am_i_coordinator.write().await =
             check_am_i_coordinator(&addresses, &self.me.to_string());
         if !read.contains(&self.me.to_string()) {
-            match RingClient::connect(format!("http://{}", self.connection.read().await.prev)).await
-            {
-                Ok(mut client) => {
-                    read.push(self.me.to_string());
-                    if let Err(e) = client
-                        .coordinate(CoordinateRequest { addresses, read })
-                        .await
-                    {
-                        warn!(
-                            "{}.coordinate responses {}",
-                            self.connection.read().await.prev,
-                            e
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "{}.coordinate responses {}",
-                        self.connection.read().await.prev,
-                        e
-                    );
-                }
-            }
+            self.relay_coordinate_rpc_in_background(addresses, read)
+                .await;
         }
 
         Ok(Response::new(Empty {}))
     }
     async fn election(&self, request: Request<ListRequest>) -> Result<Response<Empty>, Status> {
-        let mut addresses = request.into_inner().addresses;
+        let addresses = request.into_inner().addresses;
         if !addresses.contains(&self.me.to_string()) {
             // TODO: Error handling
-            // TODO: request to next in background
-            match RingClient::connect(format!("http://{}", self.connection.read().await.prev)).await
-            {
-                Ok(mut client) => {
-                    addresses.push(self.me.to_string());
-                    if let Err(e) = client.election(ListRequest { addresses }).await {
-                        warn!("{}.list responses {}", self.connection.read().await.prev, e);
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "cannot create client for {} due to {}",
-                        self.connection.read().await.prev,
-                        e
-                    );
-                }
-            }
+            self.relay_election_rpc_in_background(addresses).await;
         } else {
-            match RingClient::connect(format!("http://{}", self.connection.read().await.prev)).await
-            {
-                Ok(mut client) => {
-                    if let Err(e) = client
-                        .coordinate(CoordinateRequest {
-                            addresses,
-                            read: vec![self.me.to_string()],
-                        })
-                        .await
-                    {
-                        warn!(
-                            "{}.coordinate responses {}",
-                            self.connection.read().await.prev,
-                            e
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "cannot create client for {} due to {}",
-                        self.connection.read().await.prev,
-                        e
-                    );
-                }
-            }
+            self.relay_coordinate_rpc_in_background(addresses, Vec::new())
+                .await;
         }
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn connection_announce(
+        &self,
+        request: Request<ListRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let addresses = request.into_inner().addresses;
+        info!("announced connection: {:?}", addresses);
+        *self.ring_cache.write().await = addresses;
         Ok(Response::new(Empty {}))
     }
 }
@@ -249,6 +287,7 @@ async fn main() -> anyhow::Result<()> {
 
     let ring_service = Ring {
         me: opts.addr,
+        ring_cache: Arc::new(RwLock::new(Vec::new())),
         am_i_coordinator: am_i_coordinator.clone(),
         connection: connection.clone(),
         notify_recieved_list_rpc,
