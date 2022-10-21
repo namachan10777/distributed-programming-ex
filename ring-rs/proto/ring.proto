@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package ring;
+
+service Ring {
+    rpc SetNext(SetAddressRequest) returns (SetAddressResponse);
+    rpc SetPrev(SetAddressRequest) returns (SetAddressResponse);
+    rpc Join(JoinRequest) returns (JoinResponse) {};
+    rpc List(ListRequest) returns (Empty);
+    rpc Election(ListRequest) returns (Empty);
+    rpc Coordinate(CoordinateRequest) returns (Empty);
+}
+
+message Empty{}
+
+message SetAddressResponse {
+    optional string err_msg = 1;
+}
+
+message SetAddressRequest {
+    string address = 1;
+}
+
+message JoinRequest{
+    string prev = 1;
+}
+
+message JoinResponse {
+    oneof result {
+        string prev = 1;
+        string err_msg = 2;
+    };
+}
+
+message ListRequest {
+    repeated string addresses = 1;
+}
+
+message CoordinateRequest {
+    repeated string addresses = 1;
+    repeated string read = 2;
+}
