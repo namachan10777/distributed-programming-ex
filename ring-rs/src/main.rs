@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{bail, Context};
 use clap::Parser;
 use proto::{
     join_response, ring_client::RingClient, CoordinateRequest, Empty, JoinRequest, JoinResponse,
@@ -7,7 +7,7 @@ use proto::{
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{net::SocketAddr, process::exit};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tonic::{transport::Server, Request, Response, Status};
 use tracing::{error, info, warn};
 
@@ -32,6 +32,7 @@ enum CooridnatorEvent {
 
 struct Ring {
     me: SocketAddr,
+    join_lock: Arc<Mutex<()>>,
     am_i_coordinator: Arc<RwLock<bool>>,
     connection: Arc<RwLock<Connection>>,
     ring_cache: Arc<RwLock<Vec<String>>>,
@@ -39,7 +40,7 @@ struct Ring {
 }
 
 impl Ring {
-    async fn join_impl_no_rollback(&self, new_prev: &str) -> anyhow::Result<()> {
+    async fn join_impl_no_rollback<'a>(&self, new_prev: &str) -> anyhow::Result<()> {
         let new_prev = new_prev.parse()?;
         let old_prev = {
             let mut connection = self.connection.write().await;
@@ -61,6 +62,7 @@ impl Ring {
     }
 
     async fn join_impl(&self, new_prev: &str) -> anyhow::Result<String> {
+        let _ = self.join_lock.lock().await;
         let old_prev = self.connection.read().await.prev;
         match self.join_impl_no_rollback(new_prev).await {
             Ok(()) => Ok(old_prev.to_string()),
@@ -73,6 +75,7 @@ impl Ring {
 
     async fn relay_list_rpc_in_background(&self, mut addresses: Vec<String>) {
         let connection = self.connection.clone();
+        let member_cache = self.ring_cache.read().await.clone();
         let me = self.me;
         tokio::spawn(async move {
             if let Ok(mut client) =
@@ -81,13 +84,17 @@ impl Ring {
                 addresses.push(me.to_string());
                 if let Err(e) = client.list(ListRequest { addresses }).await {
                     warn!("{}.list responses {}", connection.read().await.prev, e);
+                    Self::recovery_prev(connection, member_cache, me).await;
                 }
+            } else {
+                Self::recovery_prev(connection, member_cache, me).await;
             }
         });
     }
 
     async fn relay_election_rpc_in_background(&self, mut addresses: Vec<String>) {
         let connection = self.connection.clone();
+        let member_cache = self.ring_cache.read().await.clone();
         let me = self.me;
         tokio::spawn(async move {
             if let Ok(mut client) =
@@ -96,7 +103,10 @@ impl Ring {
                 addresses.push(me.to_string());
                 if let Err(e) = client.election(ListRequest { addresses }).await {
                     warn!("{}.list responses {}", connection.read().await.prev, e);
+                    Self::recovery_prev(connection, member_cache, me).await;
                 }
+            } else {
+                Self::recovery_prev(connection, member_cache, me).await;
             }
         });
     }
@@ -107,6 +117,7 @@ impl Ring {
         mut read: Vec<String>,
     ) {
         let connection = self.connection.clone();
+        let member_cache = self.ring_cache.read().await.clone();
         let me = self.me;
         tokio::spawn(async move {
             match RingClient::connect(format!("http://{}", connection.read().await.prev)).await {
@@ -121,6 +132,7 @@ impl Ring {
                             connection.read().await.prev,
                             e
                         );
+                        Self::recovery_prev(connection, member_cache, me).await;
                     }
                 }
                 Err(e) => {
@@ -129,6 +141,7 @@ impl Ring {
                         connection.read().await.prev,
                         e
                     );
+                    Self::recovery_prev(connection, member_cache, me).await;
                 }
             }
         });
@@ -155,6 +168,69 @@ impl Ring {
                 }
             }
         });
+    }
+
+    async fn set_next_wrapper(me: SocketAddr, dest: SocketAddr) -> anyhow::Result<()> {
+        let mut client = RingClient::connect(format!("http://{}", dest)).await?;
+        let response = client
+            .set_next(SetAddressRequest {
+                address: me.to_string(),
+            })
+            .await?;
+        if let Some(err_msg) = response.into_inner().err_msg {
+            bail!("{}", err_msg);
+        }
+        Ok(())
+    }
+
+    async fn set_prev_wrapper(me: SocketAddr, dest: SocketAddr) -> anyhow::Result<()> {
+        let mut client = RingClient::connect(format!("http://{}", dest)).await?;
+        let response = client
+            .set_prev(SetAddressRequest {
+                address: me.to_string(),
+            })
+            .await?;
+        if let Some(err_msg) = response.into_inner().err_msg {
+            bail!("{}", err_msg);
+        }
+        Ok(())
+    }
+
+    async fn recovery_prev(
+        connection: Arc<RwLock<Connection>>,
+        member_cache: Vec<String>,
+        me: SocketAddr,
+    ) {
+        info!("recovery prev");
+        if let Some(my_idx_in_member_cache) =
+            member_cache.iter().enumerate().find_map(|(idx, address)| {
+                if address == &me.to_string() {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+        {
+            for i in 0..member_cache.len() {
+                let prev_idx = (my_idx_in_member_cache + i + 1) % member_cache.len();
+                match member_cache[prev_idx].parse() {
+                    Ok(prev) => {
+                        if let Err(e) = Self::set_next_wrapper(me, prev).await {
+                            info!("node {} doesn't working", e);
+                        } else {
+                            connection.write().await.prev = prev;
+                            break;
+                        }
+                    }
+                    Err(e) => info!(
+                        "address {} is invalid due to {}",
+                        &member_cache[prev_idx], e
+                    ),
+                }
+            }
+        } else {
+            error!("my name does'nt found in ring cache");
+        }
     }
 }
 
@@ -287,6 +363,7 @@ async fn main() -> anyhow::Result<()> {
 
     let ring_service = Ring {
         me: opts.addr,
+        join_lock: Arc::new(Mutex::new(())),
         ring_cache: Arc::new(RwLock::new(Vec::new())),
         am_i_coordinator: am_i_coordinator.clone(),
         connection: connection.clone(),
@@ -308,27 +385,10 @@ async fn main() -> anyhow::Result<()> {
                 }
                 info!("start graceful shutdown");
                 let Connection { prev, next } = *connection_for_shutdown_handler.read().await;
-                let prev_client = RingClient::connect(format!("http://{}", prev)).await;
-                let next_client = RingClient::connect(format!("http://{}", next)).await;
-                match (prev_client, next_client) {
-                    (Ok(mut prev_client), Ok(mut next_client)) => {
-                        if let Err(e) = prev_client
-                            .set_next(SetAddressRequest {
-                                address: next.to_string(),
-                            })
-                            .await
-                        {
-                            warn!("{}.set_next responses {}", prev, e);
-                        }
-                        if let Err(e) = next_client
-                            .set_prev(SetAddressRequest {
-                                address: prev.to_string(),
-                            })
-                            .await
-                        {
-                            warn!("{}.set_prev responses {}", next, e);
-                        }
-                    }
+                let prev_response = Ring::set_prev_wrapper(next, prev).await;
+                let next_response = Ring::set_next_wrapper(prev, next).await;
+                match (prev_response, next_response) {
+                    (Ok(_), Ok(_)) => {}
                     (Err(e), _) => {
                         warn!("connect to {} failed due to {}", prev, e)
                     }
