@@ -4,6 +4,7 @@
 #include "mercury_proc.h"
 #include <assert.h>
 #include <bits/pthreadtypes.h>
+#include <bits/types/sigset_t.h>
 #include <linux/limits.h>
 #include <margo.h>
 #include <mercury.h>
@@ -12,6 +13,7 @@
 #include <mercury_proc_string.h>
 #include <mercury_types.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,7 +39,9 @@ DECLARE_MARGO_RPC_HANDLER(list)
 DECLARE_MARGO_RPC_HANDLER(election)
 DECLARE_MARGO_RPC_HANDLER(coordinate)
 static hg_return_t join_ring(hg_string_t _addr);
+static void leave();
 static void *heatbeater(void *param);
+void *handle_signal(void *arg);
 
 enum {
   RECIEVED,
@@ -121,6 +125,17 @@ int main(int argc, char *argv[]) {
   if (ABT_mutex_create(&am_i_coordinator_lock) != 0) {
     return 1;
   }
+
+  pthread_t signal_wait_thread;
+  static sigset_t sigset;
+  sigemptyset(&sigset);
+  sigaddset(&sigset, SIGINT);
+  sigaddset(&sigset, SIGTERM);
+  pthread_sigmask(SIG_BLOCK, &sigset, NULL);
+  pthread_create(&signal_wait_thread, NULL, handle_signal, &sigset);
+  pthread_detach(signal_wait_thread);
+
+  printf("set signal handlers\n");
 
   env.mid = margo_init("tcp", MARGO_SERVER_MODE, 1, 10);
   assert(env.mid);
@@ -253,8 +268,65 @@ err:
   return ret;
 }
 
+static void leave() {
+  char next_str[PATH_MAX], prev_str[PATH_MAX];
+  hg_return_t ret;
+
+  size_t next_str_size = sizeof(next_str);
+  size_t prev_str_size = sizeof(prev_str);
+
+  if ((ret = margo_addr_to_string(env.mid, next_str, &next_str_size,
+                                  env.next)) != HG_SUCCESS) {
+    goto exit;
+  }
+  if ((ret = margo_addr_to_string(env.mid, prev_str, &prev_str_size,
+                                  env.prev)) != HG_SUCCESS) {
+    goto exit;
+  }
+
+  char *next_str_ptr = (char *)next_str;
+  char *prev_str_ptr = (char *)prev_str;
+
+  hg_handle_t prev_h, next_h;
+
+  if ((ret = margo_create(env.mid, env.next, env.set_prev_rpc, &next_h)) !=
+      HG_SUCCESS) {
+    goto err;
+  }
+  if ((ret = margo_create(env.mid, env.prev, env.set_next_rpc, &prev_h)) !=
+      HG_SUCCESS) {
+    goto err_prev;
+  }
+
+  if ((ret = margo_forward(next_h, &prev_str_ptr)) != HG_SUCCESS) {
+    goto err_prev;
+  }
+  if ((ret = margo_forward(prev_h, &next_str_ptr)) != HG_SUCCESS) {
+    goto err_prev;
+  }
+  return;
+
+err_prev:
+  margo_destroy(prev_h);
+err:
+  margo_destroy(next_h);
+
+exit:
+  fprintf(stderr, "leave: %s\n", HG_Error_to_string(ret));
+  exit(1);
+}
+
+void *handle_signal(void *arg) {
+  sigset_t *a = arg;
+  int sig;
+  printf("try to get signal\n");
+  sigwait(a, &sig);
+  leave();
+  printf("graceful shutdown\n");
+  exit(0);
+}
+
 static void join(hg_handle_t h) {
-  ABT_mutex_lock(join_lock);
   hg_return_t ret;
   char *joined_addr_str;
   printf("enter join_rcp handler\n");
@@ -270,10 +342,13 @@ static void join(hg_handle_t h) {
       HG_SUCCESS) {
     goto err_prev;
   }
+  ABT_mutex_lock(join_lock);
   if ((ret = margo_forward(prev_h, &joined_addr_str)) != HG_SUCCESS) {
+    ABT_mutex_unlock(join_lock);
     goto err_prev;
   }
   if ((ret = margo_destroy(prev_h)) != HG_SUCCESS) {
+    ABT_mutex_unlock(join_lock);
     goto err;
   }
 
@@ -282,25 +357,28 @@ static void join(hg_handle_t h) {
   size_t old_prev_size = sizeof(old_prev);
   if ((ret = margo_addr_to_string(env.mid, old_prev, &old_prev_size,
                                   env.prev)) != HG_SUCCESS) {
+    ABT_mutex_unlock(join_lock);
     goto err;
   }
   char *old_prev_ptr = (char *)old_prev;
   printf("response %s\n", old_prev);
   if ((ret = margo_respond(h, &old_prev_ptr)) != HG_SUCCESS) {
+    ABT_mutex_unlock(join_lock);
     goto err;
   }
 
   // self.prev = n'
   if ((ret = lookup_addr(&env.prev, joined_addr_str)) != HG_SUCCESS) {
+    ABT_mutex_unlock(join_lock);
     goto err;
   }
+  ABT_mutex_unlock(join_lock);
   if ((ret = margo_free_input(h, &joined_addr_str)) != HG_SUCCESS) {
     goto err;
   }
   if ((ret = margo_destroy(h)) != HG_SUCCESS) {
     goto exit;
   }
-  ABT_mutex_unlock(join_lock);
   return;
 err_prev:
   margo_destroy(prev_h);
@@ -316,9 +394,11 @@ static void set_prev(hg_handle_t h) {
   if ((ret = margo_get_input(h, &prev_addr_str)) != HG_SUCCESS) {
     goto err;
   }
+  ABT_mutex_lock(join_lock);
   if ((ret = lookup_addr(&env.prev, prev_addr_str)) != HG_SUCCESS) {
     goto err;
   }
+  ABT_mutex_unlock(join_lock);
   if ((ret = margo_free_input(h, &prev_addr_str)) != HG_SUCCESS) {
     goto err;
   }
@@ -338,9 +418,11 @@ static void set_next(hg_handle_t h) {
   if ((ret = margo_get_input(h, &next_addr_str)) != HG_SUCCESS) {
     goto err;
   }
+  ABT_mutex_lock(join_lock);
   if ((ret = lookup_addr(&env.next, next_addr_str)) != HG_SUCCESS) {
     goto err;
   }
+  ABT_mutex_unlock(join_lock);
   if ((ret = margo_free_input(h, &next_addr_str)) != HG_SUCCESS) {
     goto err;
   }
@@ -514,6 +596,7 @@ static void coordinate(hg_handle_t h) {
 
   ring.read = push_my_name(ring.read);
 
+  ABT_mutex_lock(join_lock);
   hg_handle_t prev_h;
   if ((ret = margo_create(env.mid, env.prev, env.coordinate_rpc, &prev_h)) !=
       HG_SUCCESS) {
@@ -522,6 +605,7 @@ static void coordinate(hg_handle_t h) {
   if ((ret = margo_forward(prev_h, &ring)) != HG_SUCCESS) {
     goto err_prev;
   }
+  ABT_mutex_unlock(join_lock);
   if ((ret = margo_destroy(prev_h)) != HG_SUCCESS) {
     goto err;
   }
@@ -553,6 +637,7 @@ static void election(hg_handle_t h) {
     for (size_t i = 0; i < node_list.len; ++i) {
       printf("eligibility member[%ld]: %s\n", i, node_list.names[i]);
     }
+    ABT_mutex_lock(join_lock);
     if ((ret = margo_create(env.mid, env.prev, env.coordinate_rpc, &prev_h)) !=
         HG_SUCCESS) {
       goto err_prev;
@@ -565,6 +650,7 @@ static void election(hg_handle_t h) {
     if ((ret = margo_forward(prev_h, &ring)) != HG_SUCCESS) {
       goto err_prev;
     }
+    ABT_mutex_unlock(join_lock);
 
     ABT_mutex_lock(am_i_coordinator_lock);
     am_i_coordinator = check_am_i_coordinator(node_list);
@@ -572,7 +658,8 @@ static void election(hg_handle_t h) {
   } else {
     node_list_t updated_node_list = push_my_name(node_list);
 
-    if ((ret = margo_create(env.mid, env.prev, env.list_rpc, &prev_h)) !=
+    ABT_mutex_lock(join_lock);
+    if ((ret = margo_create(env.mid, env.prev, env.election_rpc, &prev_h)) !=
         HG_SUCCESS) {
       goto err;
     }
@@ -580,6 +667,7 @@ static void election(hg_handle_t h) {
     if ((ret = margo_forward(prev_h, &updated_node_list)) != HG_SUCCESS) {
       goto err_prev;
     }
+    ABT_mutex_unlock(join_lock);
   }
 
   if ((ret = margo_destroy(prev_h)) != HG_SUCCESS) {
@@ -632,6 +720,7 @@ static void list(hg_handle_t h) {
 
     node_list_t updated_node_list = push_name(node_list, my_addr_str);
 
+    ABT_mutex_lock(join_lock);
     if ((ret = margo_create(env.mid, env.prev, env.list_rpc, &prev_h)) !=
         HG_SUCCESS) {
       goto err;
@@ -640,6 +729,7 @@ static void list(hg_handle_t h) {
     if ((ret = margo_forward(prev_h, &updated_node_list)) != HG_SUCCESS) {
       goto err_prev;
     }
+    ABT_mutex_unlock(join_lock);
   }
 
   if ((ret = margo_destroy(prev_h)) != HG_SUCCESS) {
