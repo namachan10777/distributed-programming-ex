@@ -1,0 +1,15 @@
+[package]
+name = "ip-sd"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.66"
+clap = {version="4.0.18", features=["derive"]}
+rmp-serde = "1.1.1"
+serde = {version="1.0.146", features=["derive"]}
+tokio = {version="1.21.2", features=["net", "rt-multi-thread", "macros"]}
+tracing = "0.1.37"
+tracing-subscriber = "0.3.16"
