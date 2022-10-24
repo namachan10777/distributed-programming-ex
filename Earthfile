@@ -17,10 +17,11 @@ mochi-base:
     RUN groupadd -g $GID $USERNAME && \
         useradd -m -s /bin/bash -u $UID -g $GID $USERNAME
 
+    WORKDIR /home/$USERNAME
+
     USER $USERNAME
-    RUN cd && \
-        git clone -c feature.manyFiles=true --depth 1 https://github.com/spack/spack.git  && \
-        . spack/share/spack/setup-env.sh && \
+    RUN git clone --depth=1 https://github.com/spack/spack.git /home/$USERNAME/spack
+    RUN . $HOME/spack/share/spack/setup-env.sh && \
         spack external find automake autoconf libtool cmake m4 pkgconf bison && \
         spack install mochi-margo ^mercury~boostsys ^libfabric fabrics=rxm,sockets,tcp,udp && \
         spack install mochi-thallium  && \
@@ -32,9 +33,9 @@ mochi-base:
 
 intro:
     FROM +mochi-base
-    COPY mochi-intro .
-    RUN ls
-    RUN meson setup build
+    WORKDIR $HOME/build
+    COPY intro .
+    RUN . $HOME/spack/share/spack/setup-env.sh && \
+        spack load mochi-margo && \
+        meson setup build
     RUN meson compile -C build
-    COPY build/server /usr/local/bin/server
-    COPY build/client /usr/local/bin/client
