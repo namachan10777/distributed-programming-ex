@@ -39,3 +39,31 @@ intro:
         spack load mochi-margo && \
         meson setup build
     RUN meson compile -C build
+
+rust-base:
+    FROM rust:latest
+    RUN cargo install cargo-chef
+    RUN curl -fsSL https://github.com/protocolbuffers/protobuf/releases/download/v21.8/protoc-21.8-linux-$(uname -m | sed -e 's/aarch64/aarch_64/').zip -o protoc.zip && \
+        unzip protoc.zip -d /usr/local/
+
+ring-rs-recipe:
+    FROM +rust-base
+    WORKDIR /work
+    COPY ring-rs .
+    RUN cargo chef prepare --recipe-path recipe.json
+    SAVE ARTIFACT recipe.json /recipe.json
+
+ring-rs-bin:
+    FROM +rust-base
+    WORKDIR /work
+    COPY +ring-rs-recipe/recipe.json recipe.json
+    RUN cargo chef cook --release --recipe-path recipe.json
+    COPY ring-rs /work
+    RUN cargo build --release
+    SAVE ARTIFACT target/release/ring-rs /bin
+
+ring-rs:
+    FROM debian:buster-slim
+    COPY +ring-rs-bin/bin /usr/local/bin/ring-rs
+    ENTRYPOINT [ "/usr/local/bin/ring-rs" ]
+	SAVE IMAGE ring-rs:latest
