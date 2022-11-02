@@ -1,0 +1,13 @@
+[package]
+name = "distfs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = { version = "4.0.18", features = ["derive"] }
+fuse3 = { version = "0.5.1", features = ["tokio-runtime"] }
+serde = { version = "1.0.147", features = ["derive"] }
+serde_json = "1.0.87"
+toml = "0.5.9"
