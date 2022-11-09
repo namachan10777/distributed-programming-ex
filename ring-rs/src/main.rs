@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use std::{net::SocketAddr, process::exit};
 use tokio::sync::{Mutex, RwLock};
 use tonic::{transport::Server, Request, Response, Status};
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, trace};
 
 mod proto {
     tonic::include_proto!("ring");
@@ -293,6 +293,7 @@ impl proto::ring_server::Ring for Ring {
 
     async fn list(&self, request: Request<ListRequest>) -> Result<Response<Empty>, Status> {
         let addresses = request.into_inner().addresses;
+        trace!("list rpc: {:?}", addresses);
 
         if let Err(e) = self
             .notify_recieved_list_rpc
@@ -316,6 +317,7 @@ impl proto::ring_server::Ring for Ring {
         request: Request<CoordinateRequest>,
     ) -> Result<Response<Empty>, Status> {
         let CoordinateRequest { addresses, read } = request.into_inner();
+        trace!("coordinate rpc: {:?} {:?}", addresses, read);
         *self.am_i_coordinator.write().await =
             check_am_i_coordinator(&addresses, &self.me.to_string());
         if !read.contains(&self.me.to_string()) {
@@ -329,10 +331,12 @@ impl proto::ring_server::Ring for Ring {
         let addresses = request.into_inner().addresses;
         if !addresses.contains(&self.me.to_string()) {
             // TODO: Error handling
-            self.relay_election_rpc_in_background(addresses).await;
+            self.relay_election_rpc_in_background(addresses.clone()).await;
+            trace!("election ongoing {:?}", addresses);
         } else {
-            self.relay_coordinate_rpc_in_background(addresses, Vec::new())
+            self.relay_coordinate_rpc_in_background(addresses.clone(), Vec::new())
                 .await;
+            trace!("coordinate started {:?}", addresses);
         }
         Ok(Response::new(Empty {}))
     }
@@ -484,15 +488,15 @@ async fn main() -> anyhow::Result<()> {
         r = server_handler => {
             match r {
                 Ok(Ok(_)) => info!("exit"),
-                Ok(Err(e)) => error!("{}", e),
-                Err(e) => error!("{}", e),
+                Ok(Err(e)) => error!("server: {}", e),
+                Err(e) => error!("server handler: {}", e),
             }
         },
         Err(e) = coordinator_watcher => {
-            error!("{}", e);
+            error!("coordinator_watcher: {}", e);
         },
         Err(e) = coordinate => {
-            error!("{}", e);
+            error!("coordinator: {}", e);
         },
     }
 
