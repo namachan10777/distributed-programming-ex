@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use std::{net::SocketAddr, process::exit};
 use tokio::sync::{Mutex, RwLock};
 use tonic::{transport::Server, Request, Response, Status};
-use tracing::{error, info, warn, trace};
+use tracing::{error, info, warn, trace, debug};
 
 mod proto {
     tonic::include_proto!("ring");
@@ -389,8 +389,8 @@ async fn main() -> anyhow::Result<()> {
                 }
                 info!("start graceful shutdown");
                 let Connection { prev, next } = *connection_for_shutdown_handler.read().await;
-                let prev_response = Ring::set_prev_wrapper(next, prev).await;
-                let next_response = Ring::set_next_wrapper(prev, next).await;
+                let prev_response = Ring::set_prev_wrapper(prev, next).await;
+                let next_response = Ring::set_next_wrapper(next, prev).await;
                 match (prev_response, next_response) {
                     (Ok(_), Ok(_)) => {}
                     (Err(e), _) => {
@@ -449,7 +449,11 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 },
-                _ = recieved_list_rpc.recv() => {}
+                _ = recieved_list_rpc.recv() => {
+                    let conn = connection.read().await;
+                    info!("prev: {}, next: {}", conn.prev, conn.next);
+                    debug!("coordination canceled");
+                }
             }
         }
     });
