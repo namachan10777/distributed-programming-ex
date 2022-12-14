@@ -6,8 +6,20 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+anyhow = "1.0.66"
+async-trait = "0.1.58"
+byteorder = "1.4.3"
 clap = { version = "4.0.18", features = ["derive"] }
 fuse3 = { version = "0.5.1", features = ["tokio-runtime", "doc"] }
+futures = "0.3.25"
+futures-util = "0.3.25"
+libc = "0.2.137"
+maplit = "1.0.2"
+nix = "0.26.1"
 serde = { version = "1.0.147", features = ["derive"] }
 serde_json = "1.0.87"
+tokio = { version = "1.21.2", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+tokio-stream = "0.1.11"
 toml = "0.5.9"
+tracing = "0.1.37"
+tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }
