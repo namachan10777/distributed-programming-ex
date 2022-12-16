@@ -25,7 +25,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReadDirStream;
-use tracing::info;
+use tracing::{error, info, warn};
 use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -162,16 +162,68 @@ impl PathFilesystem for Distfs {
 
     async fn destroy(&self, _req: Request) {}
 
+    async fn create(
+        &self,
+        _req: Request,
+        parent: &OsStr,
+        name: &OsStr,
+        mode: u32,
+        flags: u32,
+    ) -> Result<ReplyCreated, Errno> {
+        let path = self.path(parent).join(name);
+        let file = match fs::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create(true)
+            .open(&path)
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                error!("create error {:?} due to {}", path, e);
+                return Err(Errno::from(e.raw_os_error().unwrap_or(libc::EACCES)));
+            }
+        };
+        let meta = match file.metadata().await {
+            Ok(m) => m,
+            Err(e) => {
+                error!("create error {:?} due to {}", path, e);
+                return Err(Errno::from(e.raw_os_error().unwrap_or(libc::EACCES)));
+            }
+        };
+
+        let attr = attr_from_metadata(&meta);
+        let fh = self.alloc_fh().await;
+        let mut table = self.file_handlers.lock().await;
+        table.insert(fh, file);
+
+        Ok(ReplyCreated {
+            ttl: Duration::from_secs(1),
+            attr: attr,
+            generation: 0,
+            fh,
+            flags,
+        })
+    }
+
     async fn lookup(
         &self,
         _req: Request,
         parent: &OsStr,
         name: &OsStr,
     ) -> fuse3::Result<ReplyEntry> {
+        info!("lookup: {:?} : {:?}", parent, name);
         let path = self.path(parent).join(name);
+        let attr = match read_attr(&path).await {
+            Ok(attr) => attr,
+            Err(e) => {
+                error!("lookup error {:?} due to {}", path, e);
+                return Err(Errno::from(e.raw_os_error().unwrap_or(libc::EACCES)));
+            }
+        };
         Ok(ReplyEntry {
             ttl: Duration::from_secs(1),
-            attr: read_attr(path).await?,
+            attr,
         })
     }
 
@@ -182,9 +234,21 @@ impl PathFilesystem for Distfs {
         _fh: Option<u64>,
         _flags: u32,
     ) -> fuse3::Result<ReplyAttr> {
-        let path = path.ok_or_else(Errno::new_not_exist)?;
+        let path = match path.ok_or_else(Errno::new_not_exist) {
+            Ok(path) => path,
+            Err(e) => {
+                error!("getattr: Not exsits");
+                return Err(e);
+            }
+        };
         let path = self.path(path);
-        let attr = read_attr(&path).await?;
+        let attr = match read_attr(&path).await {
+            Ok(attr) => attr,
+            Err(e) => {
+                error!("getattr {:?} to {}", path, e);
+                return Err(Errno::from(e.raw_os_error().unwrap_or(libc::EACCES)));
+            }
+        };
         Ok(ReplyAttr {
             ttl: Duration::from_millis(1000),
             attr,
@@ -214,9 +278,15 @@ impl PathFilesystem for Distfs {
             .truncate(flags & libc::O_TRUNC != 0)
             .create(flags & libc::O_CREAT != 0);
         info!("{:?}", options);
-        let file = options.open(path).await.map_err(map_io_err)?;
+        let file = match options.open(&path).await {
+            Ok(file) => file,
+            Err(e) => {
+                error!("open error {:?} due to {}", path, e);
+                return Err(Errno::from(e.raw_os_error().unwrap_or(libc::EACCES)));
+            }
+        };
         self.file_handlers.lock().await.insert(fh, file);
-        info!("open success");
+        info!("open success: {:?}", path);
         Ok(ReplyOpen {
             fh: fh,
             flags: u32_flags,
@@ -226,16 +296,18 @@ impl PathFilesystem for Distfs {
     async fn read(
         &self,
         _req: Request,
-        _path: Option<&OsStr>,
+        path: Option<&OsStr>,
         fh: u64,
         offset: u64,
         size: u32,
     ) -> fuse3::Result<ReplyData> {
         let mut file_handlers = self.file_handlers.lock().await;
         let Some(file) = file_handlers.get_mut(&fh) else {
+            warn!("ENOENT {:?}", path);
             return Err(Errno::from(libc::ENOENT));
         };
         file.seek(SeekFrom::Start(offset)).await.map_err(|e| {
+            warn!("seek error {:?} due to {}", path, e);
             if let Some(err) = e.raw_os_error() {
                 Errno::from(err)
             } else {
@@ -244,14 +316,18 @@ impl PathFilesystem for Distfs {
         })?;
         let mut data = Vec::new();
         data.resize(size as usize, 0);
-        file.read_exact(&mut data).await.map_err(|e| {
+        let size = file.read(&mut data).await.map_err(|e| {
+            warn!("read error: {:?} due to {}", path, e);
             if let Some(err) = e.raw_os_error() {
                 Errno::from(err)
             } else {
                 Errno::from(libc::EACCES)
             }
         })?;
-        Ok(ReplyData { data: data.into() })
+        let read_bytes = data[0..size].to_vec();
+        Ok(ReplyData {
+            data: read_bytes.into(),
+        })
     }
 
     async fn access(&self, _req: Request, _path: &OsStr, _mask: u32) -> fuse3::Result<()> {
