@@ -1,26 +1,8 @@
-use byteorder::{ReadBytesExt, WriteBytesExt};
 use clap::Parser;
-use fuse3::path::{prelude::*, PathFilesystem};
-use fuse3::{Errno, MountOptions};
-use futures::StreamExt;
-use futures_util::stream::Iter;
-use std::collections::HashMap;
-use std::ffi::{OsStr, OsString};
-use std::io;
-use std::iter::Skip;
-use std::os::unix::{
-    fs::{FileTypeExt, MetadataExt},
-    prelude::PermissionsExt,
-};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-use std::vec::IntoIter;
-use tokio::fs;
-use tokio::io::{AsyncWriteExt, AsyncReadExt, AsyncSeekExt, SeekFrom};
-use tokio::sync::Mutex;
-use tokio_stream::wrappers::ReadDirStream;
-use tracing::{error, info, warn};
+use fuse3::path::prelude::*;
+use fuse3::MountOptions;
+use std::path::PathBuf;
+use tracing::info;
 use tracing_subscriber::prelude::*;
 
 #[derive(clap::Parser, Debug)]
