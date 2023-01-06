@@ -60,6 +60,18 @@ impl PathFilesystem for Distfs {
     async fn unlink(&self, _req: Request, _parent: &OsStr, _name: &OsStr) -> fuse3::Result<()> {
         unimplemented!()
     }
+    async fn readlink(&self, _req: Request, _path: &OsStr) -> fuse3::Result<ReplyData> {
+        unimplemented!()
+    }
+    async fn symlink(
+        &self,
+        _req: Request,
+        _parent: &OsStr,
+        _name: &OsStr,
+        _link_path: &OsStr,
+    ) -> fuse3::Result<ReplyEntry> {
+        unimplemented!()
+    }
     async fn rmdir(&self, _req: Request, _parent: &OsStr, _name: &OsStr) -> fuse3::Result<()> {
         unimplemented!()
     }
@@ -152,6 +164,20 @@ impl PathFilesystem for Distfs {
         _offset: u64,
         _length: u64,
         _mode: u32,
+    ) -> fuse3::Result<()> {
+        unimplemented!()
+    }
+
+    async fn opendir(&self, _req: Request, _path: &OsStr, _flags: u32) -> fuse3::Result<ReplyOpen> {
+        unimplemented!()
+    }
+
+    async fn releasedir(
+        &self,
+        _req: Request,
+        _path: &OsStr,
+        _fh: u64,
+        _flags: u32,
     ) -> fuse3::Result<()> {
         unimplemented!()
     }
