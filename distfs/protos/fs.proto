@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package fs;
+
+service Filesystem {
+    rpc Lookup(LookupRequest) returns (LookupResponse);
+}
+
+message LookupRequest {
+    string parent = 1;
+    string name = 2;
+}
+
+message Attr {
+}
+
+message LookupResponse {
+    message Ok {
+        uint64 ttl_ms = 1;
+        Attr attr = 2;
+    }
+    oneof result {
+        Ok ok = 1;
+        int32 errno = 2;
+    }
+}

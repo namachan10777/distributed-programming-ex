@@ -17,7 +17,7 @@ impl PathFilesystem for Distfs {
         futures_util::stream::Iter<std::vec::IntoIter<fuse3::Result<DirectoryEntryPlus>>>;
 
     async fn init(&self, _req: Request) -> fuse3::Result<()> {
-        unimplemented!()
+        Ok(())
     }
     async fn destroy(&self, _req: Request) {}
     async fn lookup(
