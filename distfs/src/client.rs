@@ -526,7 +526,7 @@ impl PathFilesystem for Distfs {
             })
             .collect::<Vec<fuse3::Result<DirectoryEntryPlus>>>();
         for entry in &entries {
-            debug!(id = req.unique, offset = format!("{:?}", entry), "readdir");
+            debug!(id = req.unique, offset = format!("{entry:?}"), "readdir");
         }
         Ok(ReplyDirectoryPlus {
             entries: futures::stream::iter(entries.into_iter()),

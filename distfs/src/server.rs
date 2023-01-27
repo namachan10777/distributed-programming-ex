@@ -57,7 +57,7 @@ impl Server {
                     Component::RootDir => self.root_path.clone(),
                     Component::ParentDir => {
                         if parent == self.root_path {
-                            return parent;
+                            parent
                         } else {
                             parent
                                 .parent()
@@ -153,7 +153,7 @@ async fn set_attr_by_path<P: AsRef<Path>>(path: P, attr: SettableAttr) -> std::i
             FileTime::from_unix_time(mtime.seconds, mtime.nanos as u32),
         )?;
     }
-    if let Some(ctime) = attr.ctime {
+    if let Some(_ctime) = attr.ctime {
         // ctime is unimplemented
     }
     if let Some(atime) = attr.atime {
@@ -165,7 +165,7 @@ async fn set_attr_by_path<P: AsRef<Path>>(path: P, attr: SettableAttr) -> std::i
     if let Some(mode) = attr.mode {
         set_permissions(path, Permissions::from_mode(mode)).await?;
     }
-    if let Some(_) = attr.lock_owner {
+    if attr.lock_owner.is_some() {
         // lock is unimplemented
     }
     Ok(())
@@ -495,7 +495,7 @@ impl Server {
 
         let mut size = 0;
 
-        file.seek(io::SeekFrom::Start(req.offset as u64))
+        file.seek(io::SeekFrom::Start(req.offset))
             .await
             .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
 
@@ -532,7 +532,7 @@ impl Server {
         let req = req.into_inner();
         let mut lock = self.fh.write().await;
         let (file, _) = lock.get_mut(&req.fh).ok_or(libc::EEXIST)?;
-        file.seek(io::SeekFrom::Start(req.offset as u64))
+        file.seek(io::SeekFrom::Start(req.offset))
             .await
             .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
         let written = file
