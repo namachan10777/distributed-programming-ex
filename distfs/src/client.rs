@@ -1,3 +1,5 @@
+// written by fuse
+
 use std::{
     ffi::{OsStr, OsString},
     sync::Arc,
@@ -14,9 +16,9 @@ use crate::proto::{
     fs::{
         attr_grpc_to_fuse3, attr_response, filesystem_client::FilesystemClient,
         ftype_grpc_to_fuse3, handle_response, read_response, readdir_response,
-        settableattr_fuse3_to_grpc, unit_response, GetAttrRequest, LookupRequest, MkdirRequest,
-        OpendirRequest, ReadRequest, ReaddirRequest, ReleasedirRequest, RenameRequest,
-        RmdirRequest, SetAttrRequest, SymlinkRequest, UnlinkRequest, OpenRequest,
+        settableattr_fuse3_to_grpc, unit_response, write_response, GetAttrRequest, LookupRequest,
+        MkdirRequest, OpenRequest, OpendirRequest, ReadRequest, ReaddirRequest, ReleasedirRequest,
+        RenameRequest, RmdirRequest, SetAttrRequest, SymlinkRequest, UnlinkRequest, WriteRequest,
     },
 };
 
@@ -291,7 +293,11 @@ impl PathFilesystem for Distfs {
         Ok(())
     }
     async fn open(&self, _req: Request, path: &OsStr, flags: u32) -> fuse3::Result<ReplyOpen> {
-        debug!(path=path.to_string_lossy().to_string(), flags=flags, "open_flag");
+        debug!(
+            path = path.to_string_lossy().to_string(),
+            flags = flags,
+            "open_flag"
+        );
         let opendir = self
             .client
             .lock()
@@ -341,12 +347,30 @@ impl PathFilesystem for Distfs {
         &self,
         _req: Request,
         _path: Option<&OsStr>,
-        _fh: u64,
-        _offset: u64,
-        _data: &[u8],
-        _flags: u32,
+        fh: u64,
+        offset: u64,
+        data: &[u8],
+        flags: u32,
     ) -> fuse3::Result<ReplyWrite> {
-        Err(Errno::from(libc::ENOSYS))
+        let written = self
+            .client
+            .lock()
+            .await
+            .write(WriteRequest {
+                data: data.to_vec(),
+                fh,
+                offset,
+                flags,
+            })
+            .await
+            .map_err(|_| Errno::from(libc::EACCES))?
+            .into_inner()
+            .result
+            .ok_or(Errno::from(libc::EACCES))?;
+        match written {
+            write_response::Result::Ok(written) => Ok(ReplyWrite { written }),
+            write_response::Result::Errno(e) => Err(Errno::from(e)),
+        }
     }
     async fn release(
         &self,

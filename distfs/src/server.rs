@@ -17,7 +17,7 @@ use nix::{
 use prost_types::Timestamp;
 use tokio::{
     fs::{self, remove_dir, rename, set_permissions, symlink, OpenOptions},
-    io::{AsyncReadExt, AsyncSeekExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::RwLock,
 };
 use tonic::Response;
@@ -25,9 +25,9 @@ use tracing::debug;
 
 use crate::proto::fs::{
     attr_response, ftype_std_to_grpc, handle_response, read_response, readdir_response,
-    unit_response, Attr, AttrResponse, GetAttrRequest, HandleResponse, OpenRequest, OpendirRequest,
-    ReadRequest, ReadResponse, ReaddirRequest, ReaddirResponse, ReleasedirRequest, SetAttrRequest,
-    SettableAttr, UnitResponse,
+    unit_response, write_response, Attr, AttrResponse, GetAttrRequest, HandleResponse, OpenRequest,
+    OpendirRequest, ReadRequest, ReadResponse, ReaddirRequest, ReaddirResponse, ReleasedirRequest,
+    SetAttrRequest, SettableAttr, UnitResponse, WriteRequest, WriteResponse,
 };
 
 use super::proto;
@@ -492,7 +492,7 @@ impl Server {
             offset = req.offset,
             "read"
         );
-        
+
         let mut size = 0;
 
         file.seek(io::SeekFrom::Start(req.offset as u64))
@@ -510,10 +510,37 @@ impl Server {
             }
         }
         data.resize(size, 0u8);
-        let meta = file.metadata().await.map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
-        debug!(size=size, data=data.len(), meta=meta.len(), "read_size");
+        let meta = file
+            .metadata()
+            .await
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
+        debug!(
+            size = size,
+            data = data.len(),
+            meta = meta.len(),
+            "read_size"
+        );
         Ok(ReadResponse {
             result: Some(read_response::Result::Ok(read_response::Ok { data })),
+        })
+    }
+
+    async fn write_impl(
+        &self,
+        req: tonic::Request<WriteRequest>,
+    ) -> Result<WriteResponse, libc::c_int> {
+        let req = req.into_inner();
+        let mut lock = self.fh.write().await;
+        let (file, _) = lock.get_mut(&req.fh).ok_or(libc::EEXIST)?;
+        file.seek(io::SeekFrom::Start(req.offset as u64))
+            .await
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
+        let written = file
+            .write(&req.data)
+            .await
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
+        Ok(WriteResponse {
+            result: Some(write_response::Result::Ok(written as u32)),
         })
     }
 }
@@ -654,6 +681,14 @@ impl proto::fs::filesystem_server::Filesystem for Server {
         Ok(Response::new(self.read_impl(req).await.unwrap_or_else(
             |e| ReadResponse {
                 result: Some(read_response::Result::Errno(e)),
+            },
+        )))
+    }
+
+    async fn write(&self, req: tonic::Request<WriteRequest>) -> RpcResult<WriteResponse> {
+        Ok(Response::new(self.write_impl(req).await.unwrap_or_else(
+            |e| WriteResponse {
+                result: Some(write_response::Result::Errno(e)),
             },
         )))
     }

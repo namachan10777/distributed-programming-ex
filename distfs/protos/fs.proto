@@ -19,6 +19,7 @@ service Filesystem {
     rpc Readdir(ReaddirRequest) returns (ReaddirResponse);
     rpc Open(OpenRequest) returns (HandleResponse);
     rpc Read(ReadRequest) returns (ReadResponse);
+    rpc Write(WriteRequest) returns (WriteResponse);
 }
 
 message LookupRequest {
@@ -89,6 +90,13 @@ message ReadRequest {
     uint64 fh = 1;
     uint64 offset = 2;
     uint32 size = 3;
+}
+
+message WriteRequest {
+    uint64 fh  = 1;
+    uint64 offset = 2;
+    bytes data = 3;
+    uint32 flags = 4;
 }
 
 enum Filetype {
@@ -194,6 +202,13 @@ message ReadResponse {
     }
     oneof result {
         Ok ok = 1;
+        int32 errno = 2;
+    }
+}
+
+message WriteResponse {
+    oneof result {
+        uint32 ok = 1;
         int32 errno = 2;
     }
 }
