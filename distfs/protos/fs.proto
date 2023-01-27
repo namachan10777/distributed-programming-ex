@@ -1,9 +1,24 @@
 syntax = "proto3";
 
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
+
 package fs;
 
 service Filesystem {
-    rpc Lookup(LookupRequest) returns (LookupResponse);
+    rpc Lookup(LookupRequest) returns (AttrResponse);
+    rpc GetAttr(GetAttrRequest) returns (AttrResponse);
+    rpc SetAttr(SetAttrRequest) returns (AttrResponse);
+    rpc Mkdir(MkdirRequest) returns (AttrResponse);
+    rpc Unlink(UnlinkRequest) returns (UnitResponse);
+    rpc Symlink(SymlinkRequest) returns (AttrResponse);
+    rpc Rmdir(RmdirRequest) returns (UnitResponse);
+    rpc Rename(RenameRequest) returns (UnitResponse);
+    rpc Opendir(OpendirRequest) returns (HandleResponse);
+    rpc Releasedir(ReleasedirRequest) returns (UnitResponse);
+    rpc Readdir(ReaddirRequest) returns (ReaddirResponse);
+    rpc Open(OpenRequest) returns (HandleResponse);
+    rpc Read(ReadRequest) returns (ReadResponse);
 }
 
 message LookupRequest {
@@ -11,13 +26,171 @@ message LookupRequest {
     string name = 2;
 }
 
-message Attr {
+message GetAttrRequest {
+    optional string path = 1;
+    optional uint64 fh = 2;
+    uint32 flags = 3;
 }
 
-message LookupResponse {
+message MkdirRequest {
+    string parent = 1;
+    string name = 2;
+    uint32 mode = 3;
+    uint32 umask = 4;
+}
+
+message UnlinkRequest {
+    string parent = 1;
+    string name = 2;
+}
+
+message SymlinkRequest {
+    string parent = 1;
+    string name = 2;
+    string link_path = 3;
+}
+
+message RmdirRequest {
+    string parent = 1;
+    string name = 2;
+}
+
+message RenameRequest {
+    string origin_parent = 1;
+    string origin_name = 2;
+    string parent = 3;
+    string name = 4;
+}
+
+message OpendirRequest {
+    string path = 1;
+    uint32 flags = 2;
+}
+
+message ReleasedirRequest {
+    uint64 fh = 1;
+    uint32 flag = 2;
+    string path = 3;
+}
+
+message ReaddirRequest {
+    string parent = 1;
+    uint64 fh = 2;
+    uint64 offset = 3;
+    uint64 lock_owner = 4;
+}
+
+message OpenRequest {
+    string path = 1;
+    uint32 flags = 2;
+}
+
+message ReadRequest {
+    uint64 fh = 1;
+    uint64 offset = 2;
+    uint32 size = 3;
+}
+
+enum Filetype {
+    NamedPipe = 0;
+    CharDevice = 1;
+    BlockDevice = 2;
+    Directory = 3;
+    RegularFile = 4;
+    Symlink = 5;
+    Socket = 6;
+}
+
+message Attr {
+    uint64 size = 1;
+    uint64 blocks = 2;
+    google.protobuf.Timestamp atime = 3;
+    google.protobuf.Timestamp mtime = 4;
+    google.protobuf.Timestamp ctime = 5;
+    Filetype kind = 6;
+    uint32 perm = 7;
+    uint32 nlink = 8;
+    uint32 uid = 9;
+    uint32 gid = 10;
+    uint32 rdev = 11;
+    uint32 flag = 12;
+    uint32 blksize = 13;
+}
+
+message SettableAttr {
+    optional uint32 mode = 1;
+    optional uint32 uid = 2;
+    optional uint32 gid = 3;
+    optional uint64 size = 4;
+    optional uint64 lock_owner = 5;
+    optional google.protobuf.Timestamp atime = 6;
+    optional google.protobuf.Timestamp mtime = 7;
+    optional google.protobuf.Timestamp ctime = 8;
+}
+
+message SetAttrRequest {
+    optional string path = 1;
+    optional uint64 fh = 2;
+    SettableAttr attr = 3;
+}
+
+message AttrResponse {
     message Ok {
         uint64 ttl_ms = 1;
         Attr attr = 2;
+    }
+    oneof result {
+        Ok ok = 1;
+        int32 errno = 2;
+    }
+}
+
+message DirEntry {
+    Filetype kind = 1;
+    string name = 2;
+    int64 offset = 3;
+    Attr attr = 4;
+    uint64 entry_ttl_ms = 5;
+    uint64 attr_ttl_ms = 6;
+}
+
+message UnitResponse {
+    oneof result {
+        google.protobuf.Empty ok = 1;
+        int32 errno = 2;
+    }
+}
+
+message HandleResponse {
+    message Ok {
+        uint64 fh = 1;
+        uint32 flag = 2;
+    }
+    oneof result {
+        Ok ok = 1;
+        int32 errno = 2;
+    }
+}
+
+message ReaddirResponse {
+    message Entry {
+        oneof inner {
+            DirEntry entry = 1;
+            int32 errno = 2;
+        }
+    }
+    message Ok {
+        repeated Entry inner = 1;
+    }
+    oneof result {
+        Ok ok = 1;
+        int32 errno = 2;
+    }
+}
+
+message ReadResponse {
+    message Ok {
+        bytes data = 1;
     }
     oneof result {
         Ok ok = 1;

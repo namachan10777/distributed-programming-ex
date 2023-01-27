@@ -1,16 +1,21 @@
 use clap::Parser;
+use distfs::proto::fs::filesystem_server::FilesystemServer;
 use fuse3::path::prelude::*;
 use fuse3::MountOptions;
-use std::path::PathBuf;
-use tracing::info;
+use std::{net::SocketAddr, path::PathBuf};
+use tonic::transport::{Server, Uri};
 use tracing_subscriber::prelude::*;
 
 #[derive(clap::Parser, Debug)]
 struct Opts {
-    #[clap(short, long)]
-    mountpoint: PathBuf,
-    #[clap(short, long)]
-    target: PathBuf,
+    #[clap(subcommand)]
+    subcommand: SubCommand,
+}
+
+#[derive(clap::Parser, Debug)]
+enum SubCommand {
+    Server { target: PathBuf, addr: SocketAddr },
+    Client { uri: Uri, mountpoint: PathBuf },
 }
 
 #[tokio::main]
@@ -31,12 +36,20 @@ async fn main() -> anyhow::Result<()> {
         .read_only(false)
         .force_readdir_plus(true);
 
-    let target = std::fs::canonicalize(&opts.target)?;
-    info!("target: {:?}", target);
-
-    Session::new(mount_options)
-        .mount_with_unprivileged(distfs::client::Distfs::new(target), opts.mountpoint)
-        .await?
-        .await?;
+    match opts.subcommand {
+        SubCommand::Server { target, addr } => {
+            let server = distfs::server::Server::new(target)?;
+            Server::builder()
+                .add_service(FilesystemServer::new(server))
+                .serve(addr)
+                .await?;
+        }
+        SubCommand::Client { uri, mountpoint } => {
+            Session::new(mount_options)
+                .mount_with_unprivileged(distfs::client::Distfs::new(uri).await?, mountpoint)
+                .await?
+                .await?;
+        }
+    }
     Ok(())
 }

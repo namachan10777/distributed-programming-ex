@@ -1,12 +1,36 @@
-use std::ffi::OsStr;
+use std::{
+    ffi::{OsStr, OsString},
+    sync::Arc,
+    time::Duration,
+};
 
-use fuse3::path::prelude::*;
+use fuse3::{path::prelude::*, Errno};
+use tokio::sync::Mutex;
+use tonic::transport::Channel;
+use tracing::debug;
 
-pub struct Distfs;
+use crate::proto::{
+    self,
+    fs::{
+        attr_grpc_to_fuse3, attr_response, filesystem_client::FilesystemClient,
+        ftype_grpc_to_fuse3, handle_response, read_response, readdir_response,
+        settableattr_fuse3_to_grpc, unit_response, GetAttrRequest, LookupRequest, MkdirRequest,
+        OpendirRequest, ReadRequest, ReaddirRequest, ReleasedirRequest, RenameRequest,
+        RmdirRequest, SetAttrRequest, SymlinkRequest, UnlinkRequest, OpenRequest,
+    },
+};
+
+pub struct Distfs {
+    client: Arc<Mutex<proto::fs::filesystem_client::FilesystemClient<Channel>>>,
+}
 
 impl Distfs {
-    pub fn new<P: AsRef<std::path::Path>>(_target: P) -> Self {
-        unimplemented!()
+    pub async fn new(
+        grpc_endpoint: tonic::transport::Uri,
+    ) -> Result<Self, tonic::transport::Error> {
+        let client = FilesystemClient::connect(grpc_endpoint.clone()).await?;
+        let client = Arc::new(Mutex::new(client));
+        Ok(Distfs { client })
     }
 }
 
@@ -23,80 +47,295 @@ impl PathFilesystem for Distfs {
     async fn lookup(
         &self,
         _req: Request,
-        _parent: &OsStr,
-        _name: &OsStr,
+        parent: &OsStr,
+        name: &OsStr,
     ) -> fuse3::Result<ReplyEntry> {
-        unimplemented!()
+        let lookup = self
+            .client
+            .lock()
+            .await
+            .lookup(LookupRequest {
+                parent: parent.to_string_lossy().to_string(),
+                name: name.to_string_lossy().to_string(),
+            })
+            .await
+            .map_err(|_| Errno::from(libc::EACCES))?;
+        let (ttl_ms, attr) = match lookup.into_inner().result {
+            Some(attr_response::Result::Errno(e)) => Err(e.into()),
+            Some(attr_response::Result::Ok(attr_response::Ok { ttl_ms, attr })) => {
+                Ok((ttl_ms, attr))
+            }
+            None => Err(Errno::from(libc::EACCES)),
+        }?;
+        let attr = attr.ok_or(Errno::from(libc::EACCES))?;
+        Ok(ReplyEntry {
+            ttl: std::time::Duration::from_millis(ttl_ms),
+            attr: crate::proto::fs::attr_grpc_to_fuse3(attr)?,
+        })
     }
+
     async fn forget(&self, _req: Request, _parent: &OsStr, _nlookup: u64) {}
     async fn getattr(
         &self,
         _req: Request,
-        _path: Option<&OsStr>,
-        _fh: Option<u64>,
-        _flags: u32,
+        path: Option<&OsStr>,
+        fh: Option<u64>,
+        flags: u32,
     ) -> fuse3::Result<ReplyAttr> {
-        unimplemented!()
+        let get_attr = self
+            .client
+            .lock()
+            .await
+            .get_attr(GetAttrRequest {
+                path: path.map(|path| path.to_string_lossy().to_string()),
+                fh,
+                flags,
+            })
+            .await
+            .map_err(|_| Errno::from(libc::EACCES))?;
+        let (ttl_ms, attr) = match get_attr.into_inner().result {
+            Some(attr_response::Result::Ok(attr_response::Ok { ttl_ms, attr })) => {
+                if let Some(attr) = attr {
+                    Ok((ttl_ms, attr))
+                } else {
+                    Err(Errno::from(libc::EACCES))
+                }
+            }
+            Some(attr_response::Result::Errno(e)) => Err(Errno::from(e)),
+            None => Err(Errno::from(libc::EACCES)),
+        }?;
+        Ok(ReplyAttr {
+            ttl: Duration::from_millis(ttl_ms),
+            attr: crate::proto::fs::attr_grpc_to_fuse3(attr)?,
+        })
     }
+
     async fn setattr(
         &self,
         _req: Request,
-        _path: Option<&OsStr>,
-        _fh: Option<u64>,
-        _set_attr: SetAttr,
+        path: Option<&OsStr>,
+        fh: Option<u64>,
+        set_attr: SetAttr,
     ) -> fuse3::Result<ReplyAttr> {
-        unimplemented!()
+        let set_attr = self
+            .client
+            .lock()
+            .await
+            .set_attr(SetAttrRequest {
+                path: path.map(|s| s.to_string_lossy().to_string()),
+                fh,
+                attr: Some(settableattr_fuse3_to_grpc(set_attr)?),
+            })
+            .await
+            .map_err(|_| Errno::from(libc::EACCES))?;
+        let (ttl_ms, attr) = match set_attr.into_inner().result {
+            Some(attr_response::Result::Ok(attr_response::Ok { ttl_ms, attr })) => {
+                if let Some(attr) = attr {
+                    Ok((ttl_ms, attr))
+                } else {
+                    Err(Errno::from(libc::EACCES))
+                }
+            }
+            Some(attr_response::Result::Errno(e)) => Err(Errno::from(e)),
+            None => Err(Errno::from(libc::EACCES)),
+        }?;
+        Ok(ReplyAttr {
+            ttl: Duration::from_millis(ttl_ms),
+            attr: crate::proto::fs::attr_grpc_to_fuse3(attr)?,
+        })
     }
+
     async fn mkdir(
         &self,
         _req: Request,
-        _parent: &OsStr,
-        _name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        parent: &OsStr,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
     ) -> fuse3::Result<ReplyEntry> {
-        unimplemented!()
+        let set_attr = self
+            .client
+            .lock()
+            .await
+            .mkdir(MkdirRequest {
+                parent: parent.to_string_lossy().to_string(),
+                name: name.to_string_lossy().to_string(),
+                mode,
+                umask,
+            })
+            .await
+            .map_err(|_| Errno::from(libc::EACCES))?;
+        let (ttl_ms, attr) = match set_attr.into_inner().result {
+            Some(attr_response::Result::Ok(attr_response::Ok { ttl_ms, attr })) => {
+                if let Some(attr) = attr {
+                    Ok((ttl_ms, attr))
+                } else {
+                    Err(Errno::from(libc::EACCES))
+                }
+            }
+            Some(attr_response::Result::Errno(e)) => Err(Errno::from(e)),
+            None => Err(Errno::from(libc::EACCES)),
+        }?;
+        Ok(ReplyEntry {
+            ttl: Duration::from_millis(ttl_ms),
+            attr: crate::proto::fs::attr_grpc_to_fuse3(attr)?,
+        })
     }
-    async fn unlink(&self, _req: Request, _parent: &OsStr, _name: &OsStr) -> fuse3::Result<()> {
-        unimplemented!()
+
+    async fn unlink(&self, _req: Request, parent: &OsStr, name: &OsStr) -> fuse3::Result<()> {
+        let unlink = self
+            .client
+            .lock()
+            .await
+            .unlink(UnlinkRequest {
+                parent: parent.to_string_lossy().to_string(),
+                name: name.to_string_lossy().to_string(),
+            })
+            .await
+            .map_err(|_| Errno::from(libc::EACCES))?;
+        if let unit_response::Result::Errno(e) = unlink
+            .into_inner()
+            .result
+            .ok_or_else(|| Errno::from(libc::EACCES))?
+        {
+            return Err(Errno::from(e));
+        }
+        Ok(())
     }
     async fn readlink(&self, _req: Request, _path: &OsStr) -> fuse3::Result<ReplyData> {
-        unimplemented!()
+        // TODO
+        Err(Errno::from(libc::ENOSYS))
     }
     async fn symlink(
         &self,
         _req: Request,
-        _parent: &OsStr,
-        _name: &OsStr,
-        _link_path: &OsStr,
+        parent: &OsStr,
+        name: &OsStr,
+        link_path: &OsStr,
     ) -> fuse3::Result<ReplyEntry> {
-        unimplemented!()
+        let symlink = self
+            .client
+            .lock()
+            .await
+            .symlink(SymlinkRequest {
+                parent: parent.to_string_lossy().to_string(),
+                name: name.to_string_lossy().to_string(),
+                link_path: link_path.to_string_lossy().to_string(),
+            })
+            .await
+            .map_err(|_| Errno::from(libc::EACCES))?;
+        let (ttl_ms, attr) = match symlink.into_inner().result {
+            Some(attr_response::Result::Ok(attr_response::Ok { ttl_ms, attr })) => {
+                if let Some(attr) = attr {
+                    Ok((ttl_ms, attr))
+                } else {
+                    Err(Errno::from(libc::EACCES))
+                }
+            }
+            Some(attr_response::Result::Errno(e)) => Err(Errno::from(e)),
+            None => Err(Errno::from(libc::EACCES)),
+        }?;
+        Ok(ReplyEntry {
+            ttl: Duration::from_millis(ttl_ms),
+            attr: crate::proto::fs::attr_grpc_to_fuse3(attr)?,
+        })
     }
-    async fn rmdir(&self, _req: Request, _parent: &OsStr, _name: &OsStr) -> fuse3::Result<()> {
-        unimplemented!()
+
+    async fn rmdir(&self, _req: Request, parent: &OsStr, name: &OsStr) -> fuse3::Result<()> {
+        let rmdir = self
+            .client
+            .lock()
+            .await
+            .rmdir(RmdirRequest {
+                parent: parent.to_string_lossy().to_string(),
+                name: name.to_string_lossy().to_string(),
+            })
+            .await
+            .map_err(|_| Errno::from(libc::EACCES))?;
+        if let unit_response::Result::Errno(e) = rmdir
+            .into_inner()
+            .result
+            .ok_or_else(|| Errno::from(libc::EACCES))?
+        {
+            return Err(Errno::from(e));
+        }
+        Ok(())
     }
     async fn rename(
         &self,
         _req: Request,
-        _origin_parent: &OsStr,
-        _origin_name: &OsStr,
-        _parent: &OsStr,
-        _name: &OsStr,
+        origin_parent: &OsStr,
+        origin_name: &OsStr,
+        parent: &OsStr,
+        name: &OsStr,
     ) -> fuse3::Result<()> {
-        unimplemented!()
+        let rename = self
+            .client
+            .lock()
+            .await
+            .rename(RenameRequest {
+                origin_parent: origin_parent.to_string_lossy().to_string(),
+                origin_name: origin_name.to_string_lossy().to_string(),
+                parent: parent.to_string_lossy().to_string(),
+                name: name.to_string_lossy().to_string(),
+            })
+            .await
+            .map_err(|_| Errno::from(libc::EACCES))?;
+        if let unit_response::Result::Errno(e) = rename
+            .into_inner()
+            .result
+            .ok_or_else(|| Errno::from(libc::EACCES))?
+        {
+            return Err(Errno::from(e));
+        }
+        Ok(())
     }
-    async fn open(&self, _req: Request, _path: &OsStr, _flags: u32) -> fuse3::Result<ReplyOpen> {
-        unimplemented!()
+    async fn open(&self, _req: Request, path: &OsStr, flags: u32) -> fuse3::Result<ReplyOpen> {
+        debug!(path=path.to_string_lossy().to_string(), flags=flags, "open_flag");
+        let opendir = self
+            .client
+            .lock()
+            .await
+            .open(OpenRequest {
+                path: path.to_string_lossy().to_string(),
+                flags,
+            })
+            .await
+            .map_err(|_| Errno::from(libc::EACCES))?
+            .into_inner()
+            .result
+            .ok_or_else(|| Errno::from(libc::EACCES))?;
+        match opendir {
+            handle_response::Result::Ok(handle_response::Ok { fh, flag }) => {
+                Ok(ReplyOpen { fh, flags: flag })
+            }
+            handle_response::Result::Errno(e) => Err(Errno::from(e)),
+        }
     }
     async fn read(
         &self,
         _req: Request,
         _path: Option<&OsStr>,
-        _fh: u64,
-        _offset: u64,
-        _size: u32,
+        fh: u64,
+        offset: u64,
+        size: u32,
     ) -> fuse3::Result<ReplyData> {
-        unimplemented!()
+        let read = self
+            .client
+            .lock()
+            .await
+            .read(ReadRequest { fh, offset, size })
+            .await
+            .map_err(|_| Errno::from(libc::EACCES))?
+            .into_inner()
+            .result
+            .ok_or_else(|| Errno::from(libc::EACCES))?;
+        match read {
+            read_response::Result::Ok(read_response::Ok { data }) => {
+                Ok(ReplyData { data: data.into() })
+            }
+            read_response::Result::Errno(e) => Err(Errno::from(e)),
+        }
     }
     async fn write(
         &self,
@@ -107,7 +346,7 @@ impl PathFilesystem for Distfs {
         _data: &[u8],
         _flags: u32,
     ) -> fuse3::Result<ReplyWrite> {
-        unimplemented!()
+        Err(Errno::from(libc::ENOSYS))
     }
     async fn release(
         &self,
@@ -118,7 +357,7 @@ impl PathFilesystem for Distfs {
         _lock_owner: u64,
         _flush: bool,
     ) -> fuse3::Result<()> {
-        unimplemented!()
+        Err(Errno::from(libc::ENOSYS))
     }
     async fn fsync(
         &self,
@@ -127,7 +366,7 @@ impl PathFilesystem for Distfs {
         _fh: u64,
         _datasync: bool,
     ) -> fuse3::Result<()> {
-        unimplemented!()
+        Err(Errno::from(libc::ENOSYS))
     }
     async fn flush(
         &self,
@@ -136,10 +375,10 @@ impl PathFilesystem for Distfs {
         _fh: u64,
         _lock_owner: u64,
     ) -> fuse3::Result<()> {
-        unimplemented!()
+        Err(Errno::from(libc::ENOSYS))
     }
     async fn access(&self, _req: Request, _path: &OsStr, _mask: u32) -> fuse3::Result<()> {
-        unimplemented!()
+        Err(libc::ENOSYS.into())
     }
     async fn create(
         &self,
@@ -149,11 +388,9 @@ impl PathFilesystem for Distfs {
         _mode: u32,
         _flags: u32,
     ) -> fuse3::Result<ReplyCreated> {
-        unimplemented!()
+        Err(libc::ENOSYS.into())
     }
-    async fn batch_forget(&self, _req: Request, _paths: &[&OsStr]) {
-        unimplemented!()
-    }
+    async fn batch_forget(&self, _req: Request, _paths: &[&OsStr]) {}
 
     #[cfg(target_os = "linux")]
     async fn fallocate(
@@ -165,32 +402,111 @@ impl PathFilesystem for Distfs {
         _length: u64,
         _mode: u32,
     ) -> fuse3::Result<()> {
-        unimplemented!()
+        Err(libc::ENOSYS.into())
     }
 
-    async fn opendir(&self, _req: Request, _path: &OsStr, _flags: u32) -> fuse3::Result<ReplyOpen> {
-        unimplemented!()
+    async fn opendir(&self, _req: Request, path: &OsStr, flags: u32) -> fuse3::Result<ReplyOpen> {
+        let opendir = self
+            .client
+            .lock()
+            .await
+            .opendir(OpendirRequest {
+                path: path.to_string_lossy().to_string(),
+                flags,
+            })
+            .await
+            .map_err(|_| Errno::from(libc::EACCES))?
+            .into_inner()
+            .result
+            .ok_or_else(|| Errno::from(libc::EACCES))?;
+        match opendir {
+            handle_response::Result::Ok(handle_response::Ok { fh, flag }) => {
+                Ok(ReplyOpen { fh, flags: flag })
+            }
+            handle_response::Result::Errno(e) => Err(Errno::from(e)),
+        }
     }
 
     async fn releasedir(
         &self,
         _req: Request,
-        _path: &OsStr,
-        _fh: u64,
-        _flags: u32,
+        path: &OsStr,
+        fh: u64,
+        flags: u32,
     ) -> fuse3::Result<()> {
-        unimplemented!()
+        let releasedir = self
+            .client
+            .lock()
+            .await
+            .releasedir(ReleasedirRequest {
+                path: path.to_string_lossy().to_string(),
+                fh,
+                flag: flags,
+            })
+            .await
+            .map_err(|_| Errno::from(libc::EACCES))?;
+        if let unit_response::Result::Errno(e) = releasedir
+            .into_inner()
+            .result
+            .ok_or_else(|| Errno::from(libc::EACCES))?
+        {
+            return Err(Errno::from(e));
+        }
+        Ok(())
     }
 
     async fn readdirplus(
         &self,
-        _req: Request,
-        _parent: &OsStr,
-        _fh: u64,
-        _offset: u64,
-        _lock_owner: u64,
+        req: Request,
+        parent: &OsStr,
+        fh: u64,
+        offset: u64,
+        lock_owner: u64,
     ) -> fuse3::Result<ReplyDirectoryPlus<Self::DirEntryPlusStream>> {
-        unimplemented!()
+        let readdir = self
+            .client
+            .lock()
+            .await
+            .readdir(ReaddirRequest {
+                fh,
+                offset,
+                lock_owner,
+                parent: parent.to_string_lossy().to_string(),
+            })
+            .await
+            .map_err(|_| Errno::from(libc::EACCES))?
+            .into_inner()
+            .result
+            .ok_or(Errno::from(libc::EACCES))?;
+        let entries = match readdir {
+            readdir_response::Result::Errno(e) => Err(Errno::from(e)),
+            readdir_response::Result::Ok(entries) => Ok(entries.inner),
+        }?;
+        let entries = entries
+            .into_iter()
+            .map(|entry| {
+                let entry = entry.inner.ok_or(libc::EACCES)?;
+                let entry = match entry {
+                    readdir_response::entry::Inner::Entry(entry) => Ok(entry),
+                    readdir_response::entry::Inner::Errno(e) => Err(e),
+                }?;
+                let kind = entry.kind();
+                Ok(DirectoryEntryPlus {
+                    attr: attr_grpc_to_fuse3(entry.attr.ok_or(libc::EACCES)?)?,
+                    kind: ftype_grpc_to_fuse3(kind),
+                    name: OsString::from(entry.name),
+                    offset: entry.offset,
+                    attr_ttl: Duration::from_millis(entry.attr_ttl_ms),
+                    entry_ttl: Duration::from_millis(entry.entry_ttl_ms),
+                })
+            })
+            .collect::<Vec<fuse3::Result<DirectoryEntryPlus>>>();
+        for entry in &entries {
+            debug!(id = req.unique, offset = format!("{:?}", entry), "readdir");
+        }
+        Ok(ReplyDirectoryPlus {
+            entries: futures::stream::iter(entries.into_iter()),
+        })
     }
     async fn rename2(
         &self,
@@ -201,7 +517,7 @@ impl PathFilesystem for Distfs {
         _name: &OsStr,
         _flags: u32,
     ) -> fuse3::Result<()> {
-        unimplemented!()
+        Err(libc::ENOSYS.into())
     }
     async fn lseek(
         &self,
@@ -211,7 +527,7 @@ impl PathFilesystem for Distfs {
         _offset: u64,
         _whence: u32,
     ) -> fuse3::Result<ReplyLSeek> {
-        unimplemented!()
+        Err(libc::ENOSYS.into())
     }
     async fn copy_file_range(
         &self,
@@ -225,6 +541,6 @@ impl PathFilesystem for Distfs {
         _length: u64,
         _flags: u64,
     ) -> fuse3::Result<ReplyCopyFileRange> {
-        unimplemented!()
+        Err(libc::ENOSYS.into())
     }
 }
