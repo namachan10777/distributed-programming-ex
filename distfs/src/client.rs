@@ -9,17 +9,20 @@ use std::{
 use fuse3::{path::prelude::*, Errno};
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
-use tracing::debug;
+use tracing::{debug, warn};
 
-use crate::proto::{
-    self,
-    fs::{
-        attr_grpc_to_fuse3, attr_response, filesystem_client::FilesystemClient,
-        ftype_grpc_to_fuse3, handle_response, read_response, readdir_response,
-        settableattr_fuse3_to_grpc, unit_response, write_response, GetAttrRequest, LookupRequest,
-        MkdirRequest, OpenRequest, OpendirRequest, ReadRequest, ReaddirRequest, ReleasedirRequest,
-        RenameRequest, RmdirRequest, SetAttrRequest, SymlinkRequest, UnlinkRequest, WriteRequest,
+use crate::{
+    proto::{
+        self,
+        fs::{
+            attr_response, filesystem_client::FilesystemClient, handle_response, read_response,
+            readdir_response, unit_response, write_response, GetAttrRequest, LookupRequest,
+            MkdirRequest, OpenRequest, OpendirRequest, ReadRequest, ReaddirRequest,
+            ReleasedirRequest, RenameRequest, RmdirRequest, SetAttrRequest, SymlinkRequest,
+            UnlinkRequest, WriteRequest,
+        },
     },
+    type_conv,
 };
 
 pub struct Distfs {
@@ -72,7 +75,7 @@ impl PathFilesystem for Distfs {
         let attr = attr.ok_or(Errno::from(libc::EACCES))?;
         Ok(ReplyEntry {
             ttl: std::time::Duration::from_millis(ttl_ms),
-            attr: crate::proto::fs::attr_grpc_to_fuse3(attr)?,
+            attr: type_conv::attr::grpc_to_fuse3(attr)?,
         })
     }
 
@@ -108,7 +111,7 @@ impl PathFilesystem for Distfs {
         }?;
         Ok(ReplyAttr {
             ttl: Duration::from_millis(ttl_ms),
-            attr: crate::proto::fs::attr_grpc_to_fuse3(attr)?,
+            attr: type_conv::attr::grpc_to_fuse3(attr)?,
         })
     }
 
@@ -126,7 +129,7 @@ impl PathFilesystem for Distfs {
             .set_attr(SetAttrRequest {
                 path: path.map(|s| s.to_string_lossy().to_string()),
                 fh,
-                attr: Some(settableattr_fuse3_to_grpc(set_attr)?),
+                attr: Some(type_conv::set_attr::fuse3_to_grpc(set_attr)?),
             })
             .await
             .map_err(|_| Errno::from(libc::EACCES))?;
@@ -143,7 +146,7 @@ impl PathFilesystem for Distfs {
         }?;
         Ok(ReplyAttr {
             ttl: Duration::from_millis(ttl_ms),
-            attr: crate::proto::fs::attr_grpc_to_fuse3(attr)?,
+            attr: type_conv::attr::grpc_to_fuse3(attr)?,
         })
     }
 
@@ -180,7 +183,7 @@ impl PathFilesystem for Distfs {
         }?;
         Ok(ReplyEntry {
             ttl: Duration::from_millis(ttl_ms),
-            attr: crate::proto::fs::attr_grpc_to_fuse3(attr)?,
+            attr: type_conv::attr::grpc_to_fuse3(attr)?,
         })
     }
 
@@ -205,6 +208,7 @@ impl PathFilesystem for Distfs {
         Ok(())
     }
     async fn readlink(&self, _req: Request, _path: &OsStr) -> fuse3::Result<ReplyData> {
+        warn!("readlink");
         // TODO
         Err(Errno::from(libc::ENOSYS))
     }
@@ -239,7 +243,7 @@ impl PathFilesystem for Distfs {
         }?;
         Ok(ReplyEntry {
             ttl: Duration::from_millis(ttl_ms),
-            attr: crate::proto::fs::attr_grpc_to_fuse3(attr)?,
+            attr: type_conv::attr::grpc_to_fuse3(attr)?,
         })
     }
 
@@ -337,9 +341,7 @@ impl PathFilesystem for Distfs {
             .result
             .ok_or_else(|| Errno::from(libc::EACCES))?;
         match read {
-            read_response::Result::Ok(read_response::Ok { data }) => {
-                Ok(ReplyData { data: data.into() })
-            }
+            read_response::Result::Ok(data) => Ok(ReplyData { data: data.into() }),
             read_response::Result::Errno(e) => Err(Errno::from(e)),
         }
     }
@@ -381,6 +383,7 @@ impl PathFilesystem for Distfs {
         _lock_owner: u64,
         _flush: bool,
     ) -> fuse3::Result<()> {
+        warn!("release");
         Err(Errno::from(libc::ENOSYS))
     }
     async fn fsync(
@@ -390,6 +393,7 @@ impl PathFilesystem for Distfs {
         _fh: u64,
         _datasync: bool,
     ) -> fuse3::Result<()> {
+        warn!("fsync");
         Err(Errno::from(libc::ENOSYS))
     }
     async fn flush(
@@ -402,6 +406,7 @@ impl PathFilesystem for Distfs {
         Err(Errno::from(libc::ENOSYS))
     }
     async fn access(&self, _req: Request, _path: &OsStr, _mask: u32) -> fuse3::Result<()> {
+        warn!("access");
         Err(libc::ENOSYS.into())
     }
     async fn create(
@@ -412,6 +417,7 @@ impl PathFilesystem for Distfs {
         _mode: u32,
         _flags: u32,
     ) -> fuse3::Result<ReplyCreated> {
+        warn!("create");
         Err(libc::ENOSYS.into())
     }
     async fn batch_forget(&self, _req: Request, _paths: &[&OsStr]) {}
@@ -516,8 +522,8 @@ impl PathFilesystem for Distfs {
                 }?;
                 let kind = entry.kind();
                 Ok(DirectoryEntryPlus {
-                    attr: attr_grpc_to_fuse3(entry.attr.ok_or(libc::EACCES)?)?,
-                    kind: ftype_grpc_to_fuse3(kind),
+                    attr: type_conv::attr::grpc_to_fuse3(entry.attr.ok_or(libc::EACCES)?)?,
+                    kind: type_conv::filetype::grpc_to_fuse3(kind),
                     name: OsString::from(entry.name),
                     offset: entry.offset,
                     attr_ttl: Duration::from_millis(entry.attr_ttl_ms),
@@ -541,6 +547,7 @@ impl PathFilesystem for Distfs {
         _name: &OsStr,
         _flags: u32,
     ) -> fuse3::Result<()> {
+        warn!("rename2");
         Err(libc::ENOSYS.into())
     }
     async fn lseek(
@@ -551,6 +558,7 @@ impl PathFilesystem for Distfs {
         _offset: u64,
         _whence: u32,
     ) -> fuse3::Result<ReplyLSeek> {
+        warn!("lseek");
         Err(libc::ENOSYS.into())
     }
     async fn copy_file_range(
@@ -565,6 +573,7 @@ impl PathFilesystem for Distfs {
         _length: u64,
         _flags: u64,
     ) -> fuse3::Result<ReplyCopyFileRange> {
+        warn!("copy_file_range");
         Err(libc::ENOSYS.into())
     }
 }

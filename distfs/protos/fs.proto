@@ -201,7 +201,7 @@ message ReadResponse {
         bytes data = 1;
     }
     oneof result {
-        Ok ok = 1;
+        bytes ok = 1;
         int32 errno = 2;
     }
 }
