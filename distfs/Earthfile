@@ -1,0 +1,22 @@
+VERSION 0.6
+FROM rust:latest
+RUN cargo install cargo-chef
+WORKDIR /work
+
+plan:
+	COPY src src
+	COPY Cargo.* .
+	RUN cargo chef prepare
+	SAVE ARTIFACT recipe.json /recipe.json
+
+build-debug:
+	COPY +plan/recipe.json .
+	RUN cargo chef cook
+	COPY src src
+	RUN cargo build
+	SAVE ARTIFACT target/debug/distfs /distfs
+
+debug:
+	FROM debian:latest
+	COPY +build-debug/distfs /usr/local/bin/distfs
+
