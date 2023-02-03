@@ -20,6 +20,15 @@ service Filesystem {
     rpc Open(OpenRequest) returns (HandleResponse);
     rpc Read(ReadRequest) returns (ReadResponse);
     rpc Write(WriteRequest) returns (WriteResponse);
+    rpc Release(ReleaseRequest) returns (UnitResponse);
+    rpc Fsync(FsyncRequest) returns (UnitResponse);
+    rpc Access(AccessRequest) returns (UnitResponse);
+    rpc Flush(FlushRequest) returns (UnitResponse);
+    rpc Create(CreateRequest) returns (CreateResponse);
+    rpc Fallocate(FallocateRequest) returns (UnitResponse);
+    rpc Lseek(LseekRequest) returns (LseekResponse);
+    rpc readlink(ReadlinkRequest) returns (ReadlinkResponse);
+    rpc CopyFileRange(CopyFileRangeRequest) returns (CopyFileRangeResponse);
 }
 
 message LookupRequest {
@@ -61,6 +70,7 @@ message RenameRequest {
     string origin_name = 2;
     string parent = 3;
     string name = 4;
+    uint32 flag = 5;
 }
 
 message OpendirRequest {
@@ -97,6 +107,61 @@ message WriteRequest {
     uint64 offset = 2;
     bytes data = 3;
     uint32 flags = 4;
+}
+
+message AccessRequest {
+    string path = 1;
+    uint32 mask = 2;
+}
+
+message FlushRequest {
+    uint64 fh = 1;
+    uint64 lock_owner = 2;
+}
+
+message CreateReqeust {
+    string parent = 1;
+    string name = 2;
+    uint32 mode = 3;
+    uint32 flags = 4;
+}
+
+message FallocateRequest {
+    uint64 fh = 1;
+    uint64 offset = 2;
+    uint64 length = 3;
+    uint32 mode = 4;
+}
+
+message LseekRequest {
+    uint64 fh = 1;
+    uint64 offset = 2;
+    uint32 whence = 3;
+}
+
+message CopyFileRangeRequest {
+    uint64 fh_in = 1;
+    uint64 offset_in = 2;
+    uint64 fh_out = 3;
+    uint64 offset_out = 4;
+    uint64 length = 5;
+    uint64 flags = 6;
+}
+
+message FsyncRequest {
+    uint64 fh = 1;
+    bool datasync = 2;
+}
+
+message CreateRequest {
+    string parent = 1;
+    string name = 2;
+    uint32 mode = 3;
+    uint32 flags = 4;
+}
+
+message ReadlinkRequest {
+    string path = 1;
 }
 
 enum Filetype {
@@ -209,6 +274,48 @@ message ReadResponse {
 message WriteResponse {
     oneof result {
         uint32 ok = 1;
+        int32 errno = 2;
+    }
+}
+
+message ReleaseRequest {
+    uint64 fh = 1;
+    uint32 flags = 2;
+    uint64 lock_owner = 3;
+    bool flush = 4;
+}
+
+message CreateResponse {
+    oneof result {
+        Ok ok = 1;
+        int32 errno = 2;
+    }
+    message Ok {
+        uint64 ttl_ms = 1;
+        Attr attr = 2;
+        uint64 generation = 3;
+        uint64 fh = 4;
+        uint32 flags = 5;
+    }
+}
+
+message LseekResponse {
+    oneof result {
+        uint64 offset = 1;
+        int32 errno = 2;
+    }
+}
+
+message ReadlinkResponse {
+    oneof result {
+        string path = 1;
+        int32 errno = 2;
+    }
+}
+
+message CopyFileRangeResponse {
+    oneof result {
+        uint64 copied = 1;
         int32 errno = 2;
     }
 }

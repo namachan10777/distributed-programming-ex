@@ -1,8 +1,8 @@
 use std::{
     collections::HashMap,
     fs::Permissions,
-    io,
-    os::unix::prelude::PermissionsExt,
+    io::{self, SeekFrom},
+    os::{fd::AsRawFd, unix::prelude::PermissionsExt},
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -11,8 +11,9 @@ use file_owner::{FileOwnerError, PathExt};
 use filetime::{set_file_atime, set_file_mtime, FileTime};
 use futures::StreamExt;
 use nix::{
+    fcntl::{copy_file_range, fallocate, FallocateFlags},
     sys::stat::Mode,
-    unistd::{mkdir, unlink},
+    unistd::{access, fsync, mkdir, unlink, AccessFlags},
 };
 use tokio::{
     fs::{self, remove_dir, rename, set_permissions, symlink, OpenOptions},
@@ -24,10 +25,14 @@ use tracing::debug;
 
 use crate::{
     proto::fs::{
-        attr_response, handle_response, read_response,
+        attr_response, copy_file_range_response, create_response, handle_response, lseek_response,
+        read_response,
         readdir_response::{self, Entry},
-        unit_response, write_response, Attr, AttrResponse, GetAttrRequest, HandleResponse,
-        OpenRequest, OpendirRequest, ReadRequest, ReadResponse, ReaddirRequest, ReaddirResponse,
+        readlink_response, unit_response, write_response, AccessRequest, Attr, AttrResponse,
+        CopyFileRangeRequest, CopyFileRangeResponse, CreateRequest, CreateResponse,
+        FallocateRequest, Filetype, FlushRequest, FsyncRequest, GetAttrRequest, HandleResponse,
+        LseekRequest, LseekResponse, OpenRequest, OpendirRequest, ReadRequest, ReadResponse,
+        ReaddirRequest, ReaddirResponse, ReadlinkRequest, ReadlinkResponse, ReleaseRequest,
         ReleasedirRequest, SetAttrRequest, SettableAttr, UnitResponse, WriteRequest, WriteResponse,
     },
     type_conv,
@@ -77,6 +82,13 @@ impl Server {
 
     fn alloc_fh(&self) -> u64 {
         self.fh_src.fetch_add(1, Ordering::SeqCst)
+    }
+
+    async fn get_attr_from_path<P: AsRef<Path>>(&self, path: P) -> Result<Attr, libc::c_int> {
+        let meta = fs::metadata(&path)
+            .await
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
+        Ok(type_conv::attr::metadata_to_grpc(meta))
     }
 }
 
@@ -147,13 +159,6 @@ async fn set_attr_by_path<P: AsRef<Path>>(path: P, attr: SettableAttr) -> std::i
 }
 
 impl Server {
-    async fn get_attr_from_path<P: AsRef<Path>>(&self, path: P) -> Result<Attr, libc::c_int> {
-        let meta = fs::metadata(&path)
-            .await
-            .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
-        Ok(type_conv::attr::metadata_to_grpc(meta))
-    }
-
     async fn lookup_impl(
         &self,
         req: tonic::Request<proto::fs::LookupRequest>,
@@ -169,7 +174,12 @@ impl Server {
         req: tonic::Request<proto::fs::GetAttrRequest>,
     ) -> Result<Attr, libc::c_int> {
         let GetAttrRequest { path, fh, flags: _ } = req.into_inner();
-        match (path, fh) {
+        debug!(
+            path = format!("{:?}", &path),
+            fh = format!("{fh:?}"),
+            "getattr"
+        );
+        match (&path, fh) {
             (_, Some(fh)) => {
                 let lock = self.fh.read().await;
                 let file = lock.get(&fh).ok_or(libc::EEXIST)?;
@@ -178,9 +188,28 @@ impl Server {
                     .metadata()
                     .await
                     .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
+                debug!(
+                    path = format!("{:?}", &path),
+                    fh = format!("{fh:?}"),
+                    "getattr_ok"
+                );
                 Ok(type_conv::attr::metadata_to_grpc(meta))
             }
-            (Some(path), None) => self.get_attr_from_path(path).await,
+            (Some(path), None) => {
+                debug!(
+                    path = format!("{:?}", &path),
+                    fh = format!("{fh:?}"),
+                    "getattr_ok"
+                );
+                let meta = self.get_attr_from_path(self.real_path(path)).await;
+                debug!(
+                    path = path,
+                    fh = format!("{fh:?}"),
+                    meta = format!("{meta:?}"),
+                    "getattr_ok"
+                );
+                meta
+            }
             (None, None) => Err(libc::EACCES),
         }
     }
@@ -296,6 +325,11 @@ impl Server {
         let readdir = fs::read_dir(&path)
             .await
             .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
+        debug!(
+            path = req.path,
+            real_path = path.to_string_lossy().to_string(),
+            "ok_opendir"
+        );
         let readdir = tokio_stream::wrappers::ReadDirStream::new(readdir);
         let inner = readdir
             .enumerate()
@@ -329,11 +363,52 @@ impl Server {
             })
             .collect::<Vec<_>>()
             .await;
+        let inner = if &req.path == "/" {
+            inner
+        } else {
+            let specials = vec![
+                readdir_response::entry::Inner::Entry(proto::fs::DirEntry {
+                    kind: Filetype::Directory.into(),
+                    name: ".".to_owned(),
+                    offset: 1,
+                    attr: Some(self.get_attr_from_path(&path).await?),
+                    entry_ttl_ms: 1000,
+                    attr_ttl_ms: 1000,
+                }),
+                readdir_response::entry::Inner::Entry(proto::fs::DirEntry {
+                    kind: Filetype::Directory.into(),
+                    name: "..".to_owned(),
+                    offset: 1,
+                    attr: Some(
+                        self.get_attr_from_path(
+                            path.parent().expect("nonroot check is already done"),
+                        )
+                        .await?,
+                    ),
+                    entry_ttl_ms: 1000,
+                    attr_ttl_ms: 1000,
+                }),
+            ];
+            specials
+                .into_iter()
+                .map(|entry| readdir_response::Entry { inner: Some(entry) })
+                .chain(inner.into_iter().map(|entry| {
+                    if let Some(readdir_response::entry::Inner::Entry(mut entry)) = entry.inner {
+                        entry.offset += 2;
+                        readdir_response::Entry {
+                            inner: Some(readdir_response::entry::Inner::Entry(entry)),
+                        }
+                    } else {
+                        entry
+                    }
+                }))
+                .collect()
+        };
         self.dh.write().await.insert(fh, (inner, path));
         Ok((fh, req.flags))
     }
 
-    async fn releasdir_impl(
+    async fn releasedir_impl(
         &self,
         req: tonic::Request<ReleasedirRequest>,
     ) -> Result<(), libc::c_int> {
@@ -438,7 +513,8 @@ impl Server {
     async fn write_impl(&self, req: tonic::Request<WriteRequest>) -> Result<u32, libc::c_int> {
         let req = req.into_inner();
         let mut lock = self.fh.write().await;
-        let (file, _) = lock.get_mut(&req.fh).ok_or(libc::EEXIST)?;
+        let (file, path) = lock.get_mut(&req.fh).ok_or(libc::EEXIST)?;
+        debug!(path = path.to_string_lossy().to_string(), "write");
         file.seek(io::SeekFrom::Start(req.offset))
             .await
             .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
@@ -447,6 +523,162 @@ impl Server {
             .await
             .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
         Ok(written as u32)
+    }
+
+    async fn release_impl(&self, req: tonic::Request<ReleaseRequest>) -> Result<(), libc::c_int> {
+        let req = req.into_inner();
+        let fh = req.fh;
+        let mut lock = self.fh.write().await;
+        let file = lock.remove(&fh);
+        if let Some((mut file, _)) = file {
+            if req.flush {
+                file.flush()
+                    .await
+                    .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn access_impl(&self, req: tonic::Request<AccessRequest>) -> Result<(), libc::c_int> {
+        let req = req.into_inner();
+        let mut flag = AccessFlags::empty();
+        let mask = req.mask as i32;
+        // F_OK is trivially
+        flag.set(AccessFlags::X_OK, libc::X_OK >> mask != 0);
+        flag.set(AccessFlags::R_OK, libc::R_OK >> mask != 0);
+        flag.set(AccessFlags::W_OK, libc::W_OK >> mask != 0);
+        access(&self.real_path(req.path), flag).map_err(|e| e as libc::c_int)?;
+        Ok(())
+    }
+
+    async fn flush_impl(&self, req: tonic::Request<FlushRequest>) -> Result<(), libc::c_int> {
+        let req = req.into_inner();
+        let mut lock = self.fh.write().await;
+        let Some((ref mut file, _)) = lock.get_mut(&req.fh) else {
+            return Err(libc::EEXIST)
+        };
+        file.flush()
+            .await
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
+        Ok(())
+    }
+
+    async fn fsync_impl(&self, req: tonic::Request<FsyncRequest>) -> Result<(), libc::c_int> {
+        let req = req.into_inner();
+        let mut lock = self.fh.write().await;
+        let (file, _) = lock.get_mut(&req.fh).ok_or(libc::EEXIST)?;
+        file.flush()
+            .await
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
+        fsync(file.as_raw_fd()).map_err(|e| e as libc::c_int)?;
+        Ok(())
+    }
+
+    async fn create_impl(
+        &self,
+        req: tonic::Request<CreateRequest>,
+    ) -> Result<create_response::Ok, libc::c_int> {
+        let req = req.into_inner();
+        let path = self.real_path(req.parent).join(req.name);
+        let append = req.flags as i32 & libc::O_APPEND != 0;
+        let w_only = req.flags as i32 & 0b11 == libc::O_WRONLY;
+        let r_only = req.flags as i32 & 0b11 == libc::O_RDONLY;
+        let rw = req.flags as i32 & 0b11 == libc::O_RDWR;
+        let file = OpenOptions::new()
+            .create(true)
+            .mode(req.mode)
+            .append(append)
+            .write(w_only | rw)
+            .read(r_only | rw)
+            .open(&path)
+            .await
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
+        let fh = self.alloc_fh();
+        let meta = file
+            .metadata()
+            .await
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
+        self.fh.write().await.insert(fh, (file, path));
+        Ok(create_response::Ok {
+            fh,
+            ttl_ms: 1000,
+            attr: Some(type_conv::attr::metadata_to_grpc(meta)),
+            generation: 0,
+            flags: req.flags,
+        })
+    }
+
+    async fn fallocate_impl(
+        &self,
+        req: tonic::Request<FallocateRequest>,
+    ) -> Result<(), libc::c_int> {
+        let req = req.into_inner();
+        let lock = self.fh.write().await;
+        let (file, _) = lock.get(&req.fh).ok_or(libc::EEXIST)?;
+        fallocate(
+            file.as_raw_fd(),
+            FallocateFlags::from_bits(req.mode as i32).ok_or(libc::EINVAL)?,
+            req.offset as i64,
+            req.length as i64,
+        )
+        .map_err(|e| e as libc::c_int)?;
+        Ok(())
+    }
+
+    async fn lseek_impl(&self, req: tonic::Request<LseekRequest>) -> Result<u64, libc::c_int> {
+        let req = req.into_inner();
+        let mut lock = self.fh.write().await;
+        let (file, _) = lock.get_mut(&req.fh).ok_or(libc::EEXIST)?;
+        let seek = match req.whence as i32 {
+            libc::SEEK_SET => file.seek(SeekFrom::Start(req.offset)).await,
+            libc::SEEK_CUR => file.seek(SeekFrom::Current(req.offset as i64)).await,
+            libc::SEEK_END => file.seek(SeekFrom::End(req.offset as i64)).await,
+            _ => Err(io::Error::from_raw_os_error(libc::ENOSYS)),
+        }
+        .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
+        Ok(seek)
+    }
+
+    async fn readlink_impl(
+        &self,
+        req: tonic::Request<ReadlinkRequest>,
+    ) -> Result<String, libc::c_int> {
+        let req = req.into_inner();
+        let link = fs::read_link(req.path)
+            .await
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
+        Ok(link.to_string_lossy().to_string())
+    }
+
+    async fn copy_file_range_impl(
+        &self,
+        req: tonic::Request<CopyFileRangeRequest>,
+    ) -> Result<u64, libc::c_int> {
+        let req = req.into_inner();
+        let mut lock = self.fh.write().await;
+        let [(file_in, _), (file_out, _)] = lock
+            .get_many_mut([&req.fh_in, &req.fh_out])
+            .ok_or(libc::EEXIST)?;
+        file_in
+            .flush()
+            .await
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
+        file_out
+            .flush()
+            .await
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
+        let mut offset_in = req.offset_in as i64;
+        let mut offset_out = req.offset_out as i64;
+        let copied = copy_file_range(
+            file_in.as_raw_fd(),
+            Some(&mut offset_in),
+            file_out.as_raw_fd(),
+            Some(&mut offset_out),
+            req.length as usize,
+        )
+        .map_err(|e| e as libc::c_int)?;
+        Ok(copied as u64)
     }
 }
 
@@ -468,7 +700,7 @@ impl proto::fs::filesystem_server::Filesystem for Server {
                             attr: Some(attr),
                         })
                     })
-                    .unwrap_or_else(|e| attr_response::Result::Errno(e)),
+                    .unwrap_or_else(attr_response::Result::Errno),
             ),
         }))
     }
@@ -487,7 +719,7 @@ impl proto::fs::filesystem_server::Filesystem for Server {
                             attr: Some(attr),
                         })
                     })
-                    .unwrap_or_else(|e| attr_response::Result::Errno(e)),
+                    .unwrap_or_else(attr_response::Result::Errno),
             ),
         }))
     }
@@ -506,7 +738,7 @@ impl proto::fs::filesystem_server::Filesystem for Server {
                             attr: Some(attr),
                         })
                     })
-                    .unwrap_or_else(|e| attr_response::Result::Errno(e)),
+                    .unwrap_or_else(attr_response::Result::Errno),
             ),
         }))
     }
@@ -525,7 +757,7 @@ impl proto::fs::filesystem_server::Filesystem for Server {
                             attr: Some(attr),
                         })
                     })
-                    .unwrap_or_else(|e| attr_response::Result::Errno(e)),
+                    .unwrap_or_else(attr_response::Result::Errno),
             ),
         }))
     }
@@ -539,7 +771,7 @@ impl proto::fs::filesystem_server::Filesystem for Server {
                 self.unlink_impl(req)
                     .await
                     .map(|()| unit_response::Result::Ok(()))
-                    .unwrap_or_else(|e| unit_response::Result::Errno(e)),
+                    .unwrap_or_else(unit_response::Result::Errno),
             ),
         }))
     }
@@ -558,7 +790,7 @@ impl proto::fs::filesystem_server::Filesystem for Server {
                             attr: Some(attr),
                         })
                     })
-                    .unwrap_or_else(|e| attr_response::Result::Errno(e)),
+                    .unwrap_or_else(attr_response::Result::Errno),
             ),
         }))
     }
@@ -572,7 +804,7 @@ impl proto::fs::filesystem_server::Filesystem for Server {
                 self.rmdir_impl(req)
                     .await
                     .map(|()| unit_response::Result::Ok(()))
-                    .unwrap_or_else(|e| unit_response::Result::Errno(e)),
+                    .unwrap_or_else(unit_response::Result::Errno),
             ),
         }))
     }
@@ -586,7 +818,7 @@ impl proto::fs::filesystem_server::Filesystem for Server {
                 self.rename_impl(req)
                     .await
                     .map(|_| unit_response::Result::Ok(()))
-                    .unwrap_or_else(|e| unit_response::Result::Errno(e)),
+                    .unwrap_or_else(unit_response::Result::Errno),
             ),
         }))
     }
@@ -597,7 +829,7 @@ impl proto::fs::filesystem_server::Filesystem for Server {
                 self.opendir_impl(req)
                     .await
                     .map(|(fh, flag)| handle_response::Result::Ok(handle_response::Ok { fh, flag }))
-                    .unwrap_or_else(|e| handle_response::Result::Errno(e)),
+                    .unwrap_or_else(handle_response::Result::Errno),
             ),
         }))
     }
@@ -608,10 +840,10 @@ impl proto::fs::filesystem_server::Filesystem for Server {
     ) -> RpcResult<UnitResponse> {
         Ok(Response::new(UnitResponse {
             result: Some(
-                self.releasdir_impl(req)
+                self.releasedir_impl(req)
                     .await
                     .map(|()| unit_response::Result::Ok(()))
-                    .unwrap_or_else(|e| unit_response::Result::Errno(e)),
+                    .unwrap_or_else(unit_response::Result::Errno),
             ),
         }))
     }
@@ -625,7 +857,7 @@ impl proto::fs::filesystem_server::Filesystem for Server {
                 self.readdir_impl(req)
                     .await
                     .map(|inner| readdir_response::Result::Ok(readdir_response::Ok { inner }))
-                    .unwrap_or_else(|e| readdir_response::Result::Errno(e)),
+                    .unwrap_or_else(readdir_response::Result::Errno),
             ),
         }))
     }
@@ -636,7 +868,7 @@ impl proto::fs::filesystem_server::Filesystem for Server {
                 self.open_impl(req)
                     .await
                     .map(|(fh, flag)| handle_response::Result::Ok(handle_response::Ok { fh, flag }))
-                    .unwrap_or_else(|e| handle_response::Result::Errno(e)),
+                    .unwrap_or_else(handle_response::Result::Errno),
             ),
         }))
     }
@@ -646,8 +878,8 @@ impl proto::fs::filesystem_server::Filesystem for Server {
             result: Some(
                 self.read_impl(req)
                     .await
-                    .map(|data| read_response::Result::Ok(data))
-                    .unwrap_or_else(|e| read_response::Result::Errno(e)),
+                    .map(read_response::Result::Ok)
+                    .unwrap_or_else(read_response::Result::Errno),
             ),
         }))
     }
@@ -657,8 +889,110 @@ impl proto::fs::filesystem_server::Filesystem for Server {
             result: Some(
                 self.write_impl(req)
                     .await
-                    .map(|written| write_response::Result::Ok(written))
-                    .unwrap_or_else(|e| write_response::Result::Errno(e)),
+                    .map(write_response::Result::Ok)
+                    .unwrap_or_else(write_response::Result::Errno),
+            ),
+        }))
+    }
+
+    async fn release(&self, req: tonic::Request<ReleaseRequest>) -> RpcResult<UnitResponse> {
+        Ok(Response::new(UnitResponse {
+            result: Some(
+                self.release_impl(req)
+                    .await
+                    .map(|()| unit_response::Result::Ok(()))
+                    .unwrap_or_else(unit_response::Result::Errno),
+            ),
+        }))
+    }
+
+    async fn access(&self, req: tonic::Request<AccessRequest>) -> RpcResult<UnitResponse> {
+        Ok(Response::new(UnitResponse {
+            result: Some(
+                self.access_impl(req)
+                    .await
+                    .map(|()| unit_response::Result::Ok(()))
+                    .unwrap_or_else(unit_response::Result::Errno),
+            ),
+        }))
+    }
+
+    async fn flush(&self, req: tonic::Request<FlushRequest>) -> RpcResult<UnitResponse> {
+        Ok(Response::new(UnitResponse {
+            result: Some(
+                self.flush_impl(req)
+                    .await
+                    .map(|()| unit_response::Result::Ok(()))
+                    .unwrap_or_else(unit_response::Result::Errno),
+            ),
+        }))
+    }
+
+    async fn fsync(&self, req: tonic::Request<FsyncRequest>) -> RpcResult<UnitResponse> {
+        Ok(Response::new(UnitResponse {
+            result: Some(
+                self.fsync_impl(req)
+                    .await
+                    .map(|()| unit_response::Result::Ok(()))
+                    .unwrap_or_else(unit_response::Result::Errno),
+            ),
+        }))
+    }
+
+    async fn create(&self, req: tonic::Request<CreateRequest>) -> RpcResult<CreateResponse> {
+        Ok(Response::new(CreateResponse {
+            result: Some(
+                self.create_impl(req)
+                    .await
+                    .map(create_response::Result::Ok)
+                    .unwrap_or_else(create_response::Result::Errno),
+            ),
+        }))
+    }
+
+    async fn fallocate(&self, req: tonic::Request<FallocateRequest>) -> RpcResult<UnitResponse> {
+        Ok(Response::new(UnitResponse {
+            result: Some(
+                self.fallocate_impl(req)
+                    .await
+                    .map(|()| unit_response::Result::Ok(()))
+                    .unwrap_or_else(unit_response::Result::Errno),
+            ),
+        }))
+    }
+
+    async fn lseek(&self, req: tonic::Request<LseekRequest>) -> RpcResult<LseekResponse> {
+        Ok(Response::new(LseekResponse {
+            result: Some(
+                self.lseek_impl(req)
+                    .await
+                    .map(lseek_response::Result::Offset)
+                    .unwrap_or_else(lseek_response::Result::Errno),
+            ),
+        }))
+    }
+
+    async fn readlink(&self, req: tonic::Request<ReadlinkRequest>) -> RpcResult<ReadlinkResponse> {
+        Ok(Response::new(ReadlinkResponse {
+            result: Some(
+                self.readlink_impl(req)
+                    .await
+                    .map(readlink_response::Result::Path)
+                    .unwrap_or_else(readlink_response::Result::Errno),
+            ),
+        }))
+    }
+
+    async fn copy_file_range(
+        &self,
+        req: tonic::Request<CopyFileRangeRequest>,
+    ) -> RpcResult<CopyFileRangeResponse> {
+        Ok(Response::new(CopyFileRangeResponse {
+            result: Some(
+                self.copy_file_range_impl(req)
+                    .await
+                    .map(copy_file_range_response::Result::Copied)
+                    .unwrap_or_else(copy_file_range_response::Result::Errno),
             ),
         }))
     }
