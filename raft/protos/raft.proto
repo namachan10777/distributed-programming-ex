@@ -5,7 +5,14 @@ package raft;
 service Raft {
     rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
     rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+    rpc SendLog(SendLogRequest) returns (SendLogResponse);
 }
+
+message SendLogRequest {
+    repeated bytes entries = 1;
+}
+
+message SendLogResponse {}
 
 message AppendEntriesRequest {
     uint64 term = 1;

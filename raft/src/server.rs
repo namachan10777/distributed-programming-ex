@@ -42,6 +42,15 @@ pub mod types {
         pub term: Term,
     }
 
+    impl From<RequestVoteResponse> for TypedRequestVoteResponse {
+        fn from(value: RequestVoteResponse) -> Self {
+            TypedRequestVoteResponse {
+                vote_granted: value.vote_granted,
+                term: Term(value.term),
+            }
+        }
+    }
+
     impl From<TypedRequestVoteResponse> for RequestVoteResponse {
         fn from(value: TypedRequestVoteResponse) -> Self {
             RequestVoteResponse {
@@ -173,6 +182,15 @@ pub mod types {
         pub fn incl(&self) -> Self {
             Self(self.0 + 1)
         }
+
+        pub fn decl(&self) -> Self {
+            if self.0 != 0 {
+                Self(self.0 - 1)
+            }
+            else {
+                Self(0)
+            }
+        }
     }
 
     impl<T> Default for Logs<T> {
@@ -181,7 +199,7 @@ pub mod types {
         }
     }
 
-    impl<T> Logs<T> {
+    impl<T: Clone> Logs<T> {
         pub fn get_mut(&mut self, index: LogIndex) -> Option<&mut Log<T>> {
             if index.0 == 0 {
                 None
@@ -209,6 +227,10 @@ pub mod types {
         pub fn insert(&mut self, index: LogIndex, log: Log<T>) {
             self.0.insert(index.0 as usize, log)
         }
+
+        pub fn logs_from(&self, from: LogIndex) -> Vec<Log<T>> {
+            self.0[from.0 as usize - 1..].to_vec()
+        }
     }
 }
 
@@ -227,7 +249,10 @@ use uuid::Uuid;
 use crate::{Error, Log, LogConsumer};
 
 use self::{
-    proto::{AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse},
+    proto::{
+        AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse,
+        SendLogRequest, SendLogResponse,
+    },
     types::{
         LogIndex, Logs, Term, TypedAppendEntriesRequest, TypedAppendEntriesResponse,
         TypedRequestVoteRequest, TypedRequestVoteResponse,
@@ -323,8 +348,7 @@ impl VolatileState {
 
 struct VolatileStateOnLeader {
     next_index: RwLock<HashMap<String, LogIndex>>,
-    #[allow(unused)]
-    match_index: HashMap<String, LogIndex>,
+    match_index: RwLock<HashMap<String, LogIndex>>,
 }
 
 impl VolatileStateOnLeader {
@@ -335,11 +359,11 @@ impl VolatileStateOnLeader {
             .collect();
         let match_index = next_index
             .keys()
-            .map(|server| (server.clone(), LogIndex::zero()))
+            .map(|server| (server.clone(), LogIndex::zero().incl()))
             .collect();
         Self {
             next_index: RwLock::new(next_index),
-            match_index,
+            match_index: RwLock::new(match_index),
         }
     }
 }
@@ -366,7 +390,7 @@ pub struct Raft<T, C> {
 }
 
 impl<
-        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        T: Serialize + DeserializeOwned + Send + Sync + Clone + 'static,
         C: LogConsumer<Target = T> + Send + Sync + 'static,
     > Raft<T, C>
 {
@@ -394,7 +418,7 @@ impl<
                     break;
                 }
                 info!("iam_leader");
-                raft.heatbeat().await;
+                Self::heatbeat(raft.clone()).await;
                 let elapsed = now.elapsed();
                 if elapsed < raft.heatbeat {
                     sleep(raft.heatbeat - elapsed).await;
@@ -403,29 +427,43 @@ impl<
         });
     }
 
-    async fn heatbeat(&self) {
-        let leader_id = self.my_addr.to_string();
-        let leader_commit = self.volatile.read().await.commit_index;
-        let term = self.persistent_state.read().await.state.current_term;
-        let (_, errors): (Vec<_>, Vec<_>) =
-            futures::future::join_all(self.servers.iter().map(|server| {
+    #[async_recursion::async_recursion]
+    async fn append_entries(raft: Arc<Self>, entries: Vec<Log<T>>) {
+        let leader_id = raft.my_addr.to_string();
+        let leader_commit = raft.volatile.read().await.commit_index;
+        let mut persistent = raft.persistent_state.write().await;
+        for entry in entries {
+            let insert_pos = persistent.state.log.last_log_index().incl();
+            persistent.state.log.insert(insert_pos, entry);
+        }
+        if let Err(e) = persistent.save().await {
+            warn!(e = e.to_string(), "failed_to_save_persistent");
+            exit(1);
+        }
+        let persistent = persistent.downgrade();
+        let term = persistent.state.current_term;
+        let last_log_index = persistent.state.log.last_log_index();
+        let (results, errors): (Vec<_>, Vec<_>) =
+            futures::future::join_all(raft.servers.iter().map(|server| {
                 let leader_id = leader_id.clone();
+                let raft = raft.clone();
                 async move {
                     if server.to_string() != leader_id {
                         let mut client =
                             proto::raft_client::RaftClient::connect(format!("http://{server}"))
                                 .await?;
-                        if let RaftState::Leader(state) = &*self.raft_state.write().await {
+                        if let RaftState::Leader(state) = &*raft.raft_state.write().await {
                             let prev_log_index = {
-                                *state
+                                state
                                     .next_index
                                     .write()
                                     .await
                                     .entry(server.to_string())
-                                    .or_insert(LogIndex::zero())
+                                    .or_insert(last_log_index.incl())
+                                    .decl()
                             };
                             let prev_log_term = {
-                                self.persistent_state
+                                raft.persistent_state
                                     .read()
                                     .await
                                     .state
@@ -434,32 +472,140 @@ impl<
                                     .map(|log| log.term)
                                     .unwrap_or(Term::zero())
                             };
-                            client
+                            let success = client
                                 .append_entries(Into::<AppendEntriesRequest>::into(
                                     TypedAppendEntriesRequest {
                                         term,
                                         leader_id,
                                         leader_commit,
-                                        entries: Vec::new(),
+                                        entries: raft
+                                            .persistent_state
+                                            .read()
+                                            .await
+                                            .state
+                                            .log
+                                            .logs_from(prev_log_index.incl())
+                                            .into_iter()
+                                            .map(|log| serde_json::to_vec(&log.inner))
+                                            .collect::<Result<_, _>>()?,
                                         prev_log_index,
                                         prev_log_term,
                                     },
                                 ))
-                                .await?;
+                                .await?
+                                .into_inner()
+                                .success;
+                            if !success {
+                                // next indexをデクリメント
+                                state
+                                    .next_index
+                                    .write()
+                                    .await
+                                    .entry(server.to_string())
+                                    .and_modify(|index| *index = index.decl())
+                                    .or_insert(LogIndex::zero().incl());
+                            } else {
+                                state
+                                    .next_index
+                                    .write()
+                                    .await
+                                    .insert(server.to_string(), last_log_index);
+                                state
+                                    .match_index
+                                    .write()
+                                    .await
+                                    .insert(server.to_string(), last_log_index);
+                            }
+                            return Ok::<_, anyhow::Error>(success);
                         }
-                        Ok::<_, anyhow::Error>(())
+                        Ok::<_, anyhow::Error>(true)
                     } else {
                         // nothing to do
-                        Ok(())
+                        Ok(true)
                     }
                 }
             }))
             .await
             .into_iter()
             .partition_result();
-        for e in errors {
-            info!(e = e.to_string(), "failed_to_heatbeat");
+        for e in &errors {
+            info!(e = e.to_string(), "failed_to_append_entries");
         }
+        if results.iter().filter(|result| **result).count() * 2 > raft.servers.len() {
+            let commit_index = raft
+                .persistent_state
+                .read()
+                .await
+                .state
+                .log
+                .last_log_index();
+            if commit_index != LogIndex::zero() {
+                raft.volatile.write().await.commit_index = commit_index.decl();
+            }
+            else {
+                raft.volatile.write().await.commit_index = LogIndex::zero();
+            }
+        }
+        if !errors.is_empty() || results.iter().any(|result| !result) {
+            Self::append_entries(raft.clone(), Vec::new()).await;
+        }
+    }
+
+    async fn heatbeat(raft: Arc<Self>) {
+        Self::append_entries(raft.clone(), Vec::new()).await;
+    }
+
+    async fn call_for_voting(raft: Arc<Self>) -> (usize, Vec<anyhow::Error>) {
+        let persistent_state = raft.persistent_state.read().await;
+        let term = persistent_state.state.current_term;
+        let last_log_index = persistent_state.state.log.last_log_index();
+        let last_log_term = persistent_state.state.log.last_log_term();
+        drop(persistent_state);
+        let (voted, errs): (Vec<_>, Vec<_>) =
+            futures::future::join_all(raft.servers.iter().map(|server| {
+                let me = raft.my_addr.to_string();
+                let timeout = raft.timeout;
+                async move {
+                    if server.to_string() != me {
+                        let channel = tonic::transport::channel::Channel::builder(
+                            format!("http://{server}").parse().unwrap(),
+                        )
+                        .timeout(Duration::from_millis((timeout.as_millis() / 3) as u64))
+                        .connect_timeout(Duration::from_millis((timeout.as_millis() / 3) as u64))
+                        .connect()
+                        .await?;
+                        let mut client = proto::raft_client::RaftClient::new(channel);
+                        info!(to = server.to_string(), me = me, "request_vote");
+                        let res = client
+                            .request_vote(Into::<RequestVoteRequest>::into(
+                                TypedRequestVoteRequest {
+                                    term,
+                                    candidate_id: me,
+                                    last_log_index,
+                                    last_log_term,
+                                },
+                            ))
+                            .await?
+                            .into_inner();
+                        Ok::<TypedRequestVoteResponse, anyhow::Error>(res.into())
+                    } else {
+                        // vote myself
+                        info!(to = me, "request_vote");
+                        Ok(TypedRequestVoteResponse {
+                            term,
+                            vote_granted: true,
+                        }
+                        .into())
+                    }
+                }
+            }))
+            .await
+            .into_iter()
+            .partition_result();
+        (
+            voted.into_iter().filter(|voted| voted.vote_granted).count(),
+            errs,
+        )
     }
 
     // 候補者になり選挙を開始する
@@ -496,56 +642,11 @@ impl<
         persistent_state.state.voted_for = Some(raft.my_addr.to_string());
         persistent_state.state.current_term = persistent_state.state.current_term.incl();
         persistent_state.save().await?;
-        let persistent_state = persistent_state.downgrade();
-        let term = persistent_state.state.current_term;
-        let last_log_index = persistent_state.state.log.last_log_index();
-        let last_log_term = persistent_state.state.log.last_log_term();
         drop(persistent_state);
-        let (voted, errs): (Vec<_>, Vec<_>) =
-            futures::future::join_all(raft.servers.iter().map(|server| {
-                let me = raft.my_addr.to_string();
-                let timeout = raft.timeout;
-                async move {
-                    if server.to_string() != me {
-                        let channel = tonic::transport::channel::Channel::builder(
-                            format!("http://{server}").parse().unwrap(),
-                        )
-                        .timeout(Duration::from_millis((timeout.as_millis() / 3) as u64))
-                        .connect_timeout(Duration::from_millis((timeout.as_millis() / 3) as u64))
-                        .connect()
-                        .await?;
-                        let mut client = proto::raft_client::RaftClient::new(channel);
-                        info!(to = server.to_string(), me = me, "request_vote");
-                        let res = client
-                            .request_vote(Into::<RequestVoteRequest>::into(
-                                TypedRequestVoteRequest {
-                                    term,
-                                    candidate_id: me,
-                                    last_log_index,
-                                    last_log_term,
-                                },
-                            ))
-                            .await?
-                            .into_inner();
-                        Ok::<_, anyhow::Error>(res)
-                    } else {
-                        // vote myself
-                        info!(to = me, "request_vote");
-                        Ok(TypedRequestVoteResponse {
-                            term,
-                            vote_granted: true,
-                        }
-                        .into())
-                    }
-                }
-            }))
-            .await
-            .into_iter()
-            .partition_result();
+        let (count, errs) = Self::call_for_voting(raft.clone()).await;
         for e in errs {
             info!(err = e.to_string(), "vote_res_fail");
         }
-        let count = voted.into_iter().filter(|vote| vote.vote_granted).count();
         info!(
             count = count,
             server_count = raft.servers.len(),
@@ -557,6 +658,7 @@ impl<
             return Ok(());
         }
         if count * 2 > raft.servers.len() {
+            let term = { raft.persistent_state.read().await.state.current_term };
             info!(term = format!("{term:?}"), "vote_win");
             *raft.raft_state.write().await = RaftState::Leader(VolatileStateOnLeader::new(
                 raft.servers.iter().map(|addr| addr.to_string()),
@@ -629,7 +731,7 @@ impl<
         Ok(server)
     }
 
-    async fn append_entries(
+    async fn append_entries_handler(
         raft: Arc<Self>,
         req: TypedAppendEntriesRequest,
     ) -> TypedAppendEntriesResponse {
@@ -669,14 +771,16 @@ impl<
             }
         };
 
-        // エントリが整合したので追記する
-        if persistent
-            .state
-            .log
-            .get(req.prev_log_index)
-            .map(|log| log.term == req.prev_log_term)
-            .unwrap_or(true)
+        // エントリの整合は同じLog indexで同じtermであれば整合しているとみなす
+        if req.prev_log_index == LogIndex::zero()
+            || persistent
+                .state
+                .log
+                .get(req.prev_log_index)
+                .map(|log| log.term == req.prev_log_term)
+                .unwrap_or(false)
         {
+            // エントリが整合したので追記する
             let mut log_index = req.prev_log_index;
             for append_entry in decoded_req_entries {
                 log_index = log_index.incl();
@@ -687,6 +791,7 @@ impl<
                 exit(1); // TODO
             }
         } else {
+            // エントリ不整合を通知
             return TypedAppendEntriesResponse {
                 term: req.term,
                 success: false,
@@ -748,10 +853,14 @@ impl<
         );
         res
     }
+
+    async fn send_log_handler(raft: Arc<Self>, logs: Vec<Vec<u8>>) {
+        unimplemented!()
+    }
 }
 
 impl<
-        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        T: Serialize + DeserializeOwned + Send + Sync + Clone + 'static,
         C: LogConsumer<Target = T> + Send + Sync + 'static,
     > Server<T, C>
 {
@@ -771,7 +880,7 @@ impl<
 
 #[async_trait::async_trait]
 impl<
-        T: Send + Sync + 'static + DeserializeOwned + Serialize,
+        T: Send + Sync + 'static + DeserializeOwned + Serialize + Clone,
         C: Send + Sync + 'static + LogConsumer<Target = T>,
     > proto::raft_server::Raft for Server<T, C>
 {
@@ -782,7 +891,9 @@ impl<
         let req = req.into_inner();
         let req: TypedAppendEntriesRequest = req.into();
         Ok(Response::new(
-            Raft::append_entries(self.0.clone(), req).await.into(),
+            Raft::append_entries_handler(self.0.clone(), req)
+                .await
+                .into(),
         ))
     }
 
@@ -793,7 +904,16 @@ impl<
         let req = req.into_inner();
         let req: TypedRequestVoteRequest = req.into();
         Ok(Response::new(
-            Raft::request_vote(self.0.clone(), req).await.into(),
+            Raft::request_vote_handler(self.0.clone(), req).await.into(),
         ))
+    }
+
+    async fn send_log(
+        &self,
+        req: Request<SendLogRequest>,
+    ) -> Result<Response<SendLogResponse>, tonic::Status> {
+        let req = req.into_inner().entries;
+        Raft::send_log_handler(self.0.clone(), req).await;
+        Ok(Response::new(SendLogResponse {}))
     }
 }
