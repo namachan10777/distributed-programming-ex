@@ -812,7 +812,7 @@ impl<
         }
     }
 
-    async fn request_vote(
+    async fn request_vote_handler(
         raft: Arc<Self>,
         req: TypedRequestVoteRequest,
     ) -> TypedRequestVoteResponse {
