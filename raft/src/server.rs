@@ -219,7 +219,7 @@ use tokio::{
     time::sleep,
 };
 use tonic::{Request, Response};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use crate::{Error, Log, LogConsumer};
@@ -320,7 +320,7 @@ impl VolatileState {
 }
 
 struct VolatileStateOnLeader {
-    next_index: HashMap<String, LogIndex>,
+    next_index: RwLock<HashMap<String, LogIndex>>,
     #[allow(unused)]
     match_index: HashMap<String, LogIndex>,
 }
@@ -336,7 +336,7 @@ impl VolatileStateOnLeader {
             .map(|(server, _)| (server.clone(), LogIndex::zero()))
             .collect();
         Self {
-            next_index,
+            next_index: RwLock::new(next_index),
             match_index,
         }
     }
@@ -368,15 +368,35 @@ impl<
         C: LogConsumer<Target = T> + Send + Sync + 'static,
     > Raft<T, C>
 {
+    async fn am_i_leader(raft: Arc<Self>) -> bool {
+        matches!(&*raft.raft_state.read().await, &RaftState::Leader(_))
+    }
+
+    async fn am_i_follower(raft: Arc<Self>) -> bool {
+        matches!(&*raft.raft_state.read().await, &RaftState::Follower)
+    }
+
+    async fn am_i_candidate(raft: Arc<Self>) -> bool {
+        matches!(&*raft.raft_state.read().await, &RaftState::Candidate)
+    }
+
+    // heatbeatの定期実行を行う。
+    // start_electionで選挙に勝利した場合にkickされる
+    // もしリーダーから外れた場合は終了
     async fn leader_process_start(raft: Arc<Self>) {
         tokio::spawn(async move {
             loop {
-                if !matches!(&*raft.raft_state.read().await, &RaftState::Leader(_)) {
+                let now = Instant::now();
+                if !Self::am_i_leader(raft.clone()).await {
                     warn!("iam_not_leader");
                     break;
                 }
+                info!("iam_leader");
                 raft.heatbeat().await;
-                sleep(raft.heatbeat).await;
+                let elapsed = now.elapsed();
+                if elapsed < raft.heatbeat {
+                    sleep(raft.heatbeat - elapsed).await;
+                }
             }
         });
     }
@@ -385,60 +405,77 @@ impl<
         let leader_id = self.my_addr.to_string();
         let leader_commit = self.volatile.read().await.commit_index;
         let term = self.persistent_state.read().await.state.current_term;
-        futures::future::join_all(self.servers.iter().map(|server| {
-            let leader_id = leader_id.clone();
-            async move {
-                if server.to_string() != leader_id {
-                    let mut client =
-                        proto::raft_client::RaftClient::connect(format!("http://{server}")).await?;
-                    if let RaftState::Leader(state) = &*self.raft_state.read().await {
-                        let prev_log_index = *state
-                            .next_index
-                            .get(&server.to_string())
-                            .ok_or_else(|| anyhow::anyhow!("{server} not found"))?;
-                        let prev_log_term = self
-                            .persistent_state
-                            .read()
-                            .await
-                            .state
-                            .log
-                            .get(prev_log_index)
-                            .ok_or_else(|| anyhow::anyhow!("{server} not found"))?
-                            .term;
-                        client
-                            .append_entries(Into::<AppendEntriesRequest>::into(
-                                TypedAppendEntriesRequest {
-                                    term,
-                                    leader_id,
-                                    leader_commit,
-                                    entries: Vec::new(),
-                                    prev_log_index,
-                                    prev_log_term,
-                                },
-                            ))
-                            .await?;
+        let (_, errors): (Vec<_>, Vec<_>) =
+            futures::future::join_all(self.servers.iter().map(|server| {
+                let leader_id = leader_id.clone();
+                async move {
+                    if server.to_string() != leader_id {
+                        let mut client =
+                            proto::raft_client::RaftClient::connect(format!("http://{server}"))
+                                .await?;
+                        if let RaftState::Leader(state) = &*self.raft_state.write().await {
+                            let prev_log_index = {
+                                *state
+                                    .next_index
+                                    .write()
+                                    .await
+                                    .entry(server.to_string())
+                                    .or_insert(LogIndex::zero())
+                            };
+                            let prev_log_term = {
+                                self.persistent_state
+                                    .read()
+                                    .await
+                                    .state
+                                    .log
+                                    .get(prev_log_index)
+                                    .map(|log| log.term)
+                                    .unwrap_or(Term::zero())
+                            };
+                            client
+                                .append_entries(Into::<AppendEntriesRequest>::into(
+                                    TypedAppendEntriesRequest {
+                                        term,
+                                        leader_id,
+                                        leader_commit,
+                                        entries: Vec::new(),
+                                        prev_log_index,
+                                        prev_log_term,
+                                    },
+                                ))
+                                .await?;
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    } else {
+                        // nothing to do
+                        Ok(())
                     }
-                    Ok::<_, anyhow::Error>(())
-                } else {
-                    // nothing to do
-                    Ok(())
                 }
-            }
-        }))
-        .await;
+            }))
+            .await
+            .into_iter()
+            .partition_result();
+        for e in errors {
+            info!(e = e.to_string(), "failed_to_heatbeat");
+        }
     }
 
+    // 候補者になり選挙を開始する
     #[async_recursion::async_recursion]
     async fn start_election(raft: Arc<Self>) -> io::Result<()> {
         {
-            let mut raft_state = raft.raft_state.write().await;
-            if matches!(&*raft_state, RaftState::Follower) {
+            // フォロワーからしか候補者にならない
+            // リーダーに選出された場合でもtimeoutは関係なく設定されるため、
+            // timeoutからのkickで再選挙しないように
+            if Self::am_i_follower(raft.clone()).await {
+                let mut raft_state = raft.raft_state.write().await;
                 *raft_state = RaftState::Candidate;
                 let mut persistent = raft.persistent_state.write().await;
                 persistent.state.voted_for = Some(raft.my_addr.to_string());
                 persistent.save().await?;
             }
         }
+        // ランダムタイムアウト
         let actual_timeout = raft.timeout
             + Duration::from_millis(
                 (raft.timeout.as_millis() as f64 * rand::random::<f64>()) as u64,
@@ -448,9 +485,11 @@ impl<
             "election_timeout"
         );
         sleep(actual_timeout).await;
-        if !matches!(&*raft.raft_state.read().await, RaftState::Candidate) {
+        // ランダムタイムアウト後も候補者なら実際に選挙を開始する
+        if !Self::am_i_candidate(raft.clone()).await {
             return Ok(());
         }
+        // タームを増加させ、自分自身に投票したことを記録する
         let mut persistent_state = raft.persistent_state.write().await;
         persistent_state.state.voted_for = Some(raft.my_addr.to_string());
         persistent_state.state.current_term = persistent_state.state.current_term.incl();
@@ -463,13 +502,14 @@ impl<
         let (voted, errs): (Vec<_>, Vec<_>) =
             futures::future::join_all(raft.servers.iter().map(|server| {
                 let me = raft.my_addr.to_string();
+                let timeout = raft.timeout;
                 async move {
                     if server.to_string() != me {
                         let channel = tonic::transport::channel::Channel::builder(
                             format!("http://{server}").parse().unwrap(),
                         )
-                        .timeout(Duration::from_millis(100))
-                        .connect_timeout(Duration::from_millis(100))
+                        .timeout(Duration::from_millis((timeout.as_millis() / 3) as u64))
+                        .connect_timeout(Duration::from_millis((timeout.as_millis() / 3) as u64))
                         .connect()
                         .await?;
                         let mut client = proto::raft_client::RaftClient::new(channel);
@@ -509,6 +549,11 @@ impl<
             server_count = raft.servers.len(),
             "my_election_result"
         );
+        // 途中で候補者以外になっていた場合は何もしない
+        // シナリオとしては選挙中に他のリーダーが選出されるなど
+        if !Self::am_i_candidate(raft.clone()).await {
+            return Ok(());
+        }
         if count * 2 > raft.servers.len() {
             info!(term = format!("{:?}", term), "vote_win");
             *raft.raft_state.write().await = RaftState::Leader(VolatileStateOnLeader::new(
@@ -522,13 +567,9 @@ impl<
             ));
             tokio::spawn(Self::leader_process_start(raft.clone()));
         } else {
-            {
-                let mut raft_state = raft.raft_state.write().await;
-                if matches!(&*raft_state, &RaftState::Follower) {
-                    return Ok(());
-                }
-                *raft_state = RaftState::Follower;
-            }
+            // 一旦フォロワーに戻り次の選挙まで待つ
+            let mut raft_state = raft.raft_state.write().await;
+            *raft_state = RaftState::Follower;
             let mut persistent = raft.persistent_state.write().await;
             persistent.state.voted_for = None;
             persistent.save().await?;
@@ -539,9 +580,7 @@ impl<
 
     async fn schedule_timeout(raft: Arc<Self>) -> Result<(), Error> {
         let local_timeout_id = Uuid::new_v4();
-        {
-            *raft.timeout_stamp.write().await = local_timeout_id;
-        }
+        *raft.timeout_stamp.write().await = local_timeout_id;
         let _timeout_checker = tokio::spawn(async move {
             sleep(raft.timeout).await;
             if &*raft.timeout_stamp.read().await == &local_timeout_id {
@@ -549,6 +588,8 @@ impl<
                 if let Err(e) = Self::start_election(raft).await {
                     warn!("{e}");
                 }
+            } else {
+                trace!("timeout_invalidated");
             }
         });
         Ok(())
@@ -602,6 +643,10 @@ impl<
         }
         {
             *raft.raft_state.write().await = RaftState::Follower;
+        }
+        if let Err(e) = Self::schedule_timeout(raft.clone()).await {
+            error!(e = e.to_string(), "failed_to_schedule_timeout");
+            exit(1);
         }
         let decoded_req_entries = match req
             .entries
