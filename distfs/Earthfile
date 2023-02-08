@@ -1,5 +1,5 @@
 VERSION 0.6
-FROM rust:latest
+FROM rust:1.67.0-slim-buster
 RUN cargo install cargo-chef
 WORKDIR /work
 
