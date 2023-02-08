@@ -175,11 +175,13 @@ pub mod types {
         }
     }
 
-    impl<T> Logs<T> {
-        pub fn new() -> Self {
-            Logs(Vec::new())
+    impl<T> Default for Logs<T> {
+        fn default() -> Self {
+            Logs(Vec::default())
         }
+    }
 
+    impl<T> Logs<T> {
         pub fn get_mut(&mut self, index: LogIndex) -> Option<&mut Log<T>> {
             if index.0 == 0 {
                 None
@@ -290,7 +292,7 @@ impl<T: Serialize + DeserializeOwned> PersistentStateImpl<T> {
             let state: PersistentState<T> = PersistentState {
                 current_term: Term::zero(),
                 voted_for: None,
-                log: Logs::new(),
+                log: Default::default(),
             };
             let json = serde_json::to_vec_pretty(&state)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -332,8 +334,8 @@ impl VolatileStateOnLeader {
             .map(|server| (server, last_log_index.incl()))
             .collect();
         let match_index = next_index
-            .iter()
-            .map(|(server, _)| (server.clone(), LogIndex::zero()))
+            .keys()
+            .map(|server| (server.clone(), LogIndex::zero()))
             .collect();
         Self {
             next_index: RwLock::new(next_index),
@@ -555,7 +557,7 @@ impl<
             return Ok(());
         }
         if count * 2 > raft.servers.len() {
-            info!(term = format!("{:?}", term), "vote_win");
+            info!(term = format!("{term:?}"), "vote_win");
             *raft.raft_state.write().await = RaftState::Leader(VolatileStateOnLeader::new(
                 raft.servers.iter().map(|addr| addr.to_string()),
                 raft.persistent_state
@@ -583,7 +585,7 @@ impl<
         *raft.timeout_stamp.write().await = local_timeout_id;
         let _timeout_checker = tokio::spawn(async move {
             sleep(raft.timeout).await;
-            if &*raft.timeout_stamp.read().await == &local_timeout_id {
+            if *raft.timeout_stamp.read().await == local_timeout_id {
                 info!("timeout");
                 if let Err(e) = Self::start_election(raft).await {
                     warn!("{e}");
