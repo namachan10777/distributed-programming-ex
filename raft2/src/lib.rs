@@ -1,3 +1,4 @@
+
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -12,11 +13,11 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::{
         broadcast::{self, Receiver},
-        Mutex, RwLock,
+        RwLock,
     },
     time::sleep,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info, log::trace, warn};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Log {
@@ -32,24 +33,28 @@ struct Persistent {
 }
 
 #[derive(Debug)]
+struct VariableState {
+    role: Role,
+    file: fs::File,
+    persistent: Persistent,
+    commit_index: usize,
+    last_applied: usize,
+}
+
+#[derive(Debug)]
 pub struct State {
-    persistent: RwLock<Persistent>,
-    commit_index: RwLock<usize>,
-    last_applied: RwLock<usize>,
-    role: RwLock<Role>,
-    file: Mutex<fs::File>,
+    state: RwLock<VariableState>,
     timeout_cancel_rx: broadcast::Receiver<()>,
     timeout_cancel_tx: broadcast::Sender<()>,
     servers: HashSet<SocketAddr>,
     me: SocketAddr,
 }
 
-impl Persistent {
-    async fn save_persistent(&self, file: &Mutex<fs::File>) -> anyhow::Result<()> {
-        let s = serde_json::to_string_pretty(&self)?;
-        let mut file = file.lock().await;
-        file.seek(std::io::SeekFrom::Start(0)).await?;
-        file.write_all(s.as_bytes()).await?;
+impl VariableState {
+    async fn save_persistent(&mut self) -> anyhow::Result<()> {
+        let s = serde_json::to_string_pretty(&self.persistent)?;
+        self.file.seek(std::io::SeekFrom::Start(0)).await?;
+        self.file.write_all(s.as_bytes()).await?;
         Ok(())
     }
 }
@@ -75,11 +80,13 @@ impl State {
             let persistent = serde_json::from_str(&s)?;
             Ok(Self {
                 servers,
-                persistent: RwLock::new(persistent),
-                commit_index: RwLock::new(0),
-                last_applied: RwLock::new(0),
-                role: RwLock::new(Role::Follower),
-                file: Mutex::new(file),
+                state: RwLock::new(VariableState {
+                    persistent: (persistent),
+                    commit_index: (0),
+                    last_applied: (0),
+                    role: (Role::Follower),
+                    file: (file),
+                }),
                 timeout_cancel_rx: rx,
                 timeout_cancel_tx: tx,
                 me,
@@ -97,11 +104,13 @@ impl State {
             file.write_all(&serde_json::to_vec(&persistent)?).await?;
             Ok(Self {
                 servers,
-                persistent: RwLock::new(persistent),
-                commit_index: RwLock::new(0),
-                last_applied: RwLock::new(0),
-                role: RwLock::new(Role::Follower),
-                file: Mutex::new(file),
+                state: RwLock::new(VariableState {
+                    persistent: (persistent),
+                    commit_index: (0),
+                    last_applied: (0),
+                    role: (Role::Follower),
+                    file: (file),
+                }),
                 timeout_cancel_rx: rx,
                 timeout_cancel_tx: tx,
                 me,
@@ -163,81 +172,97 @@ pub struct RequestVoteResponse {
 }
 
 #[async_recursion::async_recursion]
-async fn send_append_entries(state: Arc<State>) -> anyhow::Result<()> {
+async fn send_append_entries(state: Arc<State>, timeout: Duration) -> anyhow::Result<()> {
+    info!("send_append_entries");
     let responses = join_all(state.servers.iter().map(|addr| {
         let state = state.clone();
         async move {
-            if let Role::Leader {
+            let shared = state.state.read().await;
+            let Role::Leader {
+                next_index,
+                ..
+            } = &shared.role
+            else { return Ok(true) };
+            let prev_log_index = next_index
+                .write()
+                .await
+                .get(addr)
+                .ok_or_else(|| anyhow::anyhow!("{addr} not found"))?
+                .checked_sub(1)
+                .unwrap_or(0);
+            let send_logs = shared
+                .persistent
+                .logs
+                .get(prev_log_index + 1..)
+                .unwrap_or(&[])
+                .to_vec();
+            let prev_log_term = shared
+                .persistent
+                .logs
+                .get(prev_log_index)
+                .map(|log| log.term)
+                .unwrap_or(0);
+
+            let req = AppendEntriesRequest {
+                term: shared.persistent.current_term,
+                prev_log_index,
+                prev_log_term,
+                entries: send_logs,
+                leader_commit: shared.commit_index,
+            };
+            drop(shared);
+
+            let res = reqwest::Client::new()
+                .post(format!("http://{addr}/append_entries"))
+                .timeout(timeout / 3)
+                .json(&req)
+                .send()
+                .await?
+                .json::<AppendEntriesResponse>()
+                .await?
+                .success;
+
+            let shared = state.state.read().await;
+            let Role::Leader {
                 next_index,
                 match_index,
-            } = &*state.role.read().await
-            {
-                let prev_log_index = next_index
+            } = &shared.role else {
+                return Ok(true)
+            };
+
+            if res {
+                next_index
                     .write()
                     .await
-                    .get(&addr)
-                    .ok_or_else(|| anyhow::anyhow!("{addr} not found"))?
-                    .checked_sub(1)
-                    .unwrap_or(0);
-                let persistent = state.persistent.read().await;
-                let send_logs = persistent
-                    .logs
-                    .get(prev_log_index + 1..)
-                    .unwrap_or(&[])
-                    .to_vec();
-                let prev_log_term = persistent
-                    .logs
-                    .get(prev_log_index)
-                    .map(|log| log.term)
-                    .unwrap_or(0);
-                let res = reqwest::Client::new()
-                    .post(format!("http://{addr}/append_entries"))
-                    .json(&AppendEntriesRequest {
-                        term: persistent.current_term,
-                        prev_log_index,
-                        prev_log_term,
-                        entries: send_logs,
-                        leader_commit: *state.commit_index.read().await,
-                    })
-                    .send()
-                    .await?
-                    .json::<AppendEntriesResponse>()
-                    .await?
-                    .success;
-                if res {
-                    next_index
-                        .write()
-                        .await
-                        .insert(*addr, persistent.logs.len());
-                    match_index
-                        .write()
-                        .await
-                        .insert(*addr, persistent.logs.len());
-                } else {
-                    next_index
-                        .write()
-                        .await
-                        .entry(*addr)
-                        .and_modify(|next_index| {
-                            if *next_index != 0 {
-                                *next_index = *next_index - 1
-                            }
-                        });
-                }
-                Ok::<_, anyhow::Error>(res)
+                    .insert(*addr, shared.persistent.logs.len());
+                match_index
+                    .write()
+                    .await
+                    .insert(*addr, shared.persistent.logs.len());
             } else {
-                Ok(true)
+                next_index
+                    .write()
+                    .await
+                    .entry(*addr)
+                    .and_modify(|next_index| {
+                        if *next_index != 0 {
+                            *next_index -= 1
+                        }
+                    });
             }
+            Ok::<_, anyhow::Error>(res)
         }
     }))
     .await;
-    if responses.into_iter().all(|res| {
-        debug!(res = format!("{:?}", res), "response");
-        res.unwrap_or(false)
-    }) {
+    for res in &responses {
+        debug!(res = format!("{res:?}"), "response");
+    }
+    if responses.into_iter().all(|res| res.unwrap_or(false)) {
+        info!("exit_append_entries");
         Ok(())
     } else {
-        tokio::spawn(send_append_entries(state.clone()));
+        //tokio::spawn(send_append_entries(state.clone(), timeout));
+        info!("retry_append_entries");
         Ok(())
     }
 }
@@ -256,32 +281,38 @@ async fn open_election(
     if rx.try_recv().is_ok() {
         return Ok(());
     }
-    let mut persistent = state.persistent.write().await;
-    let mut role = state.role.write().await;
-    if !role.is_follower() {
+    dbg!(&state.state);
+    let mut shared = state.state.write().await;
+    if !shared.role.is_follower() {
+        debug!("i_am_not_follower");
         return Ok(());
     }
     info!("start_election");
-    *role = Role::Candidate;
-    persistent.current_term += 1;
-    persistent.save_persistent(&state.file).await?;
-    persistent.voted_for = None;
-    drop(persistent);
-    drop(role);
+    shared.role = Role::Candidate;
+    shared.persistent.current_term += 1;
+    shared.save_persistent().await?;
+    shared.persistent.voted_for = None;
+    drop(shared);
     let vote_result = join_all(state.servers.iter().map(|addr| {
         let state = state.clone();
         async move {
-            let persistent = state.persistent.read().await;
+            let shared = state.state.read().await;
             if *addr == state.me {
                 return Ok(true);
             }
             let granted = reqwest::Client::new()
                 .post(format!("http://{addr}/request_vote"))
+                .timeout(timeout / 3)
                 .json(&RequestVoteRequest {
-                    term: persistent.current_term,
+                    term: shared.persistent.current_term,
                     candidate_id: state.me,
-                    last_log_index: persistent.logs.len() - 1,
-                    last_log_term: persistent.logs.last().map(|log| log.term).unwrap_or(0),
+                    last_log_index: shared.persistent.logs.len() - 1,
+                    last_log_term: shared
+                        .persistent
+                        .logs
+                        .last()
+                        .map(|log| log.term)
+                        .unwrap_or(0),
                 })
                 .send()
                 .await?
@@ -294,22 +325,24 @@ async fn open_election(
     .await
     .into_iter()
     .filter(|result| {
-        debug!(res = format!("{:?}", result), "vote_response");
+        debug!(res = format!("{result:?}"), "vote_response");
         result.as_ref().map(|b| *b).unwrap_or(false)
     })
     .count();
+
     info!(
         total = state.servers.len(),
         gain = vote_result,
         "vote_result"
     );
+    let mut shared = state.state.write().await;
     if vote_result * 2 > state.servers.len() {
-        let mut role = state.role.write().await;
-        if !role.is_candidate() {
+        if !shared.role.is_candidate() {
             return Ok(());
         }
+        info!("vote_win");
         // 当選
-        let next_index_base = state.persistent.read().await.logs.len() - 1;
+        let next_index_base = shared.persistent.logs.len() - 1;
         let next_index = state
             .servers
             .iter()
@@ -320,10 +353,9 @@ async fn open_election(
             .iter()
             .map(|addr| (*addr, 0))
             .collect::<HashMap<_, _>>();
-        let mut persistent = state.persistent.write().await;
-        persistent.voted_for = None;
-        persistent.save_persistent(&state.file).await?;
-        *role = Role::Leader {
+        shared.persistent.voted_for = None;
+        shared.save_persistent().await?;
+        shared.role = Role::Leader {
             next_index: RwLock::new(next_index),
             match_index: RwLock::new(match_index),
         };
@@ -331,7 +363,7 @@ async fn open_election(
         tokio::spawn(async move {
             loop {
                 let now = Instant::now();
-                if let Err(e) = send_append_entries(state.clone()).await {
+                if let Err(e) = send_append_entries(state.clone(), timeout).await {
                     warn!("{e}");
                 }
                 let elapsed = now.elapsed();
@@ -342,11 +374,11 @@ async fn open_election(
         });
         Ok(())
     } else {
-        let mut persistent = state.persistent.write().await;
+        info!("vote_loose");
         // 落選
-        persistent.voted_for = None;
-        persistent.save_persistent(&state.file).await?;
-        *state.role.write().await = Role::Follower;
+        shared.persistent.voted_for = None;
+        shared.save_persistent().await?;
+        shared.role = Role::Follower;
         Ok(())
     }
 }
@@ -357,8 +389,11 @@ pub async fn launch(state: Arc<State>, timeout: Duration, heatbeat: Duration) {
         loop {
             let rx2 = rx.resubscribe();
             if let Err(e) = tokio::select! {
-                _ = rx.recv() => Ok(()),
+                _ = rx.recv() => {
+                    Ok(())
+                },
                 _ = tokio::time::sleep(timeout) => {
+                    trace!("append_entries_timeout");
                     open_election(state.clone(), timeout, heatbeat, rx2).await
                 }
             } {
@@ -368,12 +403,12 @@ pub async fn launch(state: Arc<State>, timeout: Duration, heatbeat: Duration) {
     });
 }
 
-async fn putoff_timeout(state: Arc<State>) -> anyhow::Result<()> {
+async fn putoff_timeout(state: &State) -> anyhow::Result<()> {
     state.timeout_cancel_tx.send(())?;
     Ok(())
 }
 
-async fn post_log(state: Arc<State>, logs: Vec<String>) -> anyhow::Result<()> {
+async fn post_log(_state: Arc<State>, _logs: Vec<String>) -> anyhow::Result<()> {
     unimplemented!()
 }
 
@@ -381,31 +416,41 @@ pub async fn append_entries(
     state: Arc<State>,
     req: AppendEntriesRequest,
 ) -> anyhow::Result<AppendEntriesResponse> {
-    let mut persistent = state.persistent.write().await;
-    if req.term < persistent.current_term {
+    let mut shared = state.state.write().await;
+    if req.term < shared.persistent.current_term {
+        debug!("deny_append_entry_by_term");
         return Ok(AppendEntriesResponse { success: false });
     }
-    if req.term > persistent.current_term {
-        *state.role.write().await = Role::Follower;
-        persistent.voted_for = None;
+    putoff_timeout(&state).await?;
+    if req.term > shared.persistent.current_term {
+        shared.role = Role::Follower;
+        shared.persistent.voted_for = None;
     }
-    if req.prev_log_index >= persistent.logs.len()
-        || persistent.logs[req.prev_log_index].term != req.term
+    if req.prev_log_index >= shared.persistent.logs.len()
+        || shared.persistent.logs[req.prev_log_index].term != req.prev_log_term
     {
+        debug!(
+            logs = format!("{:?}", shared.persistent.logs),
+            prev_log_index = req.prev_log_index,
+            prev_log_term = req.prev_log_term,
+            "deny_append_entry_by_conflicting"
+        );
         return Ok(AppendEntriesResponse { success: false });
     }
-    persistent.logs.resize_with(
+    shared.persistent.logs.resize_with(
         req.prev_log_index + 1 + req.entries.len(),
         || unreachable!(),
     );
     for (offset, log) in req.entries.into_iter().enumerate() {
-        persistent.logs.insert(offset + req.prev_log_index + 1, log);
+        shared
+            .persistent
+            .logs
+            .insert(offset + req.prev_log_index + 1, log);
     }
-    let mut commit_index = state.commit_index.write().await;
-    if req.leader_commit > *commit_index {
-        *commit_index = req.leader_commit.min(persistent.logs.len() - 1);
+    if req.leader_commit > shared.commit_index {
+        shared.commit_index = req.leader_commit.min(shared.persistent.logs.len() - 1);
     }
-    persistent.save_persistent(&state.file).await?;
+    shared.save_persistent().await?;
     Ok(AppendEntriesResponse { success: true })
 }
 
@@ -413,22 +458,29 @@ pub async fn request_vote(
     state: Arc<State>,
     req: RequestVoteRequest,
 ) -> anyhow::Result<RequestVoteResponse> {
-    let mut persistent = state.persistent.write().await;
-    if req.term < persistent.current_term {
+    info!("try_request_vote");
+    let mut shared = state.state.write().await;
+    if req.term < shared.persistent.current_term {
+        info!("deny_request_vote");
         return Ok(RequestVoteResponse {
             term: req.term,
             vote_granted: false,
         });
     }
-    if req.term > persistent.current_term {
-        *state.role.write().await = Role::Follower;
+    if req.term > shared.persistent.current_term {
+        shared.role = Role::Follower;
     }
-    let vote_granted = persistent
+    let vote_granted = shared
+        .persistent
         .voted_for
         .map(|candidate| candidate == req.candidate_id)
         .unwrap_or(true);
-    persistent.voted_for = Some(req.candidate_id);
-    persistent.save_persistent(&state.file).await?;
+    if vote_granted {
+        putoff_timeout(&state).await?;
+    }
+    shared.persistent.voted_for = Some(req.candidate_id);
+    shared.save_persistent().await?;
+    info!("finish_request_vote");
     Ok(RequestVoteResponse {
         term: req.term,
         vote_granted,

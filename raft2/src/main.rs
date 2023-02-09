@@ -17,7 +17,7 @@ struct Opts {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     use tracing_subscriber::prelude::*;
-    let opts = Opts::parse();
+    let _opts = Opts::parse();
     tracing_subscriber::registry()
         .with(EnvFilter::from_default_env())
         .with(tracing_subscriber::fmt::layer())
