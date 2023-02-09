@@ -14,7 +14,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::{
         broadcast::{self, Receiver},
-        RwLock,
+        Mutex, RwLock,
     },
     time::sleep,
 };
@@ -47,6 +47,7 @@ pub struct State {
     timeout_cancel_rx: broadcast::Receiver<()>,
     timeout_cancel_tx: broadcast::Sender<()>,
     servers: HashSet<SocketAddr>,
+    append_entries_lock: Mutex<()>,
     me: SocketAddr,
 }
 
@@ -89,6 +90,7 @@ impl State {
                 }),
                 timeout_cancel_rx: rx,
                 timeout_cancel_tx: tx,
+                append_entries_lock: Mutex::new(()),
                 me,
             })
         } else {
@@ -112,6 +114,7 @@ impl State {
                 }),
                 timeout_cancel_rx: rx,
                 timeout_cancel_tx: tx,
+                append_entries_lock: Mutex::new(()),
                 me,
             })
         }
@@ -171,7 +174,35 @@ pub struct RequestVoteResponse {
 }
 
 #[async_recursion::async_recursion]
-async fn send_append_entries(state: Arc<State>, timeout: Duration) -> anyhow::Result<bool> {
+async fn send_append_entries(
+    state: Arc<State>,
+    timeout: Duration,
+    append_logs: Vec<String>,
+) -> anyhow::Result<bool> {
+    // persistent.logsが途中で書き換えられたらまずい
+    // append_entriesが複数発行されると同じタームを持つリーダーが二人いるのと同じ状態になる
+    // そもそもappend_entriesを並列して実行する必要はないのでロックを取る
+    // ここ以外にpersistent_logsが変更される可能性のある場所はappend_entriesの受けてハンドラのみ
+    // ただそこではfollowerでなければ拒否される
+    // followerに落ちているならばappend_entriesは過半数から拒否されるはずなので問題なし。どうせ捨てられる
+    // followerに落ちていないならば変更されないので問題なし
+    // append_entriesが適用されているが応答が帰ってない場合はリーダーから転落することはない
+    // なぜならappend_entriesのタイムアウトはリーダーのタイムアウトより短い
+    // よってappend_entries適用後の応答がリーダーがタイムアウト出来るほど長いならその前に
+    // こちら側でタイムアウトが起きる
+    let _ = state.append_entries_lock.lock().await;
+    let mut shared = state.state.write().await;
+    ensure!(shared.role.is_leader(), "i_am_not_leader");
+    let mut logs = append_logs
+        .into_iter()
+        .map(|text| Log {
+            term: shared.persistent.current_term,
+            text,
+        })
+        .collect_vec();
+    shared.persistent.logs.append(&mut logs);
+    shared.save_persistent().await?;
+    drop(shared);
     info!("send_append_entries");
     let responses = join_all(state.servers.iter().map(|addr| {
         let state = state.clone();
@@ -305,6 +336,7 @@ async fn open_election(
         return Ok(());
     }
     info!("start_election");
+    putoff_timeout(&state).await?;
     shared.role = Role::Candidate;
     shared.persistent.current_term += 1;
     shared.save_persistent().await?;
@@ -353,10 +385,24 @@ async fn open_election(
         "vote_result"
     );
     let mut shared = state.state.write().await;
+    // この後起こりうる状態は選挙での敗北か勝利の二択
+    // この間ログ関連は変更される可能性があるがそれは選挙とは関係しないので問題ない
+    // * 敗北したのに途中の変更により勝利できる状態になるかもしれないが、別の勝者がいるならそれで問題ない
+    //   * Raftでは自己判断でリーダーに昇格はしない。必ず承認が必要なのでリーダーが複数現れることにはならない
+    // また別のリーダーが現れてフォロワーに落ちる場合がある
+    // * 選挙で勝ったならば新しいリーダーになれば良い
+    //   * ただしフォロワーに転落したということはおそらく選挙にも負けているはず……
+    //   * 誤って勝者となっても既に過半数からはAppendEntriesが拒否されるはずなので問題ない
+    // * が、フォロワーに落ちているなら落ちたままが望ましいのでチェックしておく
+    // * 途中でtermが増加する可能性がある
+    //   * 選挙中にも関わらずさらに新しく選挙を開始した場合がこれ
+    //     * これは発生しない。なぜなら選挙が始まった時点でタイムアウトの延期を行う。選挙はタイムアウトより短い時間でタイムアウトする。
+    // . * フォロワーに転落する場合もあり得る
+    // .   * 前述の状態なので問題ない
+    if !shared.role.is_candidate() {
+        return Ok(());
+    }
     if vote_result * 2 > state.servers.len() {
-        if !shared.role.is_candidate() {
-            return Ok(());
-        }
         info!("vote_win");
         // 当選
         let next_index_base = shared.persistent.logs.len() - 1;
@@ -383,7 +429,7 @@ async fn open_election(
                     break;
                 }
                 let now = Instant::now();
-                if let Err(e) = send_append_entries(state.clone(), timeout).await {
+                if let Err(e) = send_append_entries(state.clone(), timeout, Vec::new()).await {
                     warn!("{e}");
                 }
                 let elapsed = now.elapsed();
@@ -448,20 +494,7 @@ pub async fn post_log(
     logs: Vec<String>,
     timeout: Duration,
 ) -> anyhow::Result<bool> {
-    {
-        let mut shared = state.state.write().await;
-        ensure!(shared.role.is_leader(), "i_am_not_leader");
-        let mut logs = logs
-            .into_iter()
-            .map(|text| Log {
-                term: shared.persistent.current_term,
-                text,
-            })
-            .collect_vec();
-        shared.persistent.logs.append(&mut logs);
-        shared.save_persistent().await?;
-    }
-    send_append_entries(state.clone(), timeout).await
+    send_append_entries(state.clone(), timeout, logs).await
 }
 
 pub async fn append_entries(
