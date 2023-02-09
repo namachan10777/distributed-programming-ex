@@ -1,0 +1,11 @@
+@require: coins/report
+
+document(|
+  author = {Masaki Nakano};
+  department = {情報科学};
+  en = false;
+  id = 202013553;
+  faculty = {情報};
+  title = {ソフトウェアエンジニアリング最終レポート};
+|) '<
+>
