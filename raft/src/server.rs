@@ -617,10 +617,15 @@ impl<
             // timeoutからのkickで再選挙しないように
             if Self::am_i_follower(raft.clone()).await {
                 let mut raft_state = raft.raft_state.write().await;
+                debug!("change_to_candidate");
                 *raft_state = RaftState::Candidate;
                 let mut persistent = raft.persistent_state.write().await;
                 persistent.state.voted_for = Some(raft.my_addr.to_string());
                 persistent.save().await?;
+            }
+            else {
+                info!("not_follower");
+                return Ok(())
             }
         }
         // ランダムタイムアウト
@@ -669,11 +674,14 @@ impl<
                     .log
                     .last_log_index(),
             ));
+
+                debug!("change_to_leader");
             tokio::spawn(Self::leader_process_start(raft.clone()));
         } else {
             // 一旦フォロワーに戻り次の選挙まで待つ
             let mut raft_state = raft.raft_state.write().await;
             *raft_state = RaftState::Follower;
+            debug!("change_to_follower");
             let mut persistent = raft.persistent_state.write().await;
             persistent.state.voted_for = None;
             persistent.save().await?;
@@ -747,6 +755,7 @@ impl<
         }
         {
             *raft.raft_state.write().await = RaftState::Follower;
+            debug!("change_to_follower");
         }
         if let Err(e) = Self::schedule_timeout(raft.clone()).await {
             error!(e = e.to_string(), "failed_to_schedule_timeout");
@@ -822,7 +831,7 @@ impl<
             exit(1);
         }
         let res = {
-            let persistent = raft.persistent_state.read().await;
+            let mut persistent = raft.persistent_state.write().await;
             if req.term < persistent.state.current_term {
                 info!("refuse_vote_by_term");
                 return TypedRequestVoteResponse {
@@ -830,6 +839,16 @@ impl<
                     vote_granted: false,
                 };
             };
+            if req.term > persistent.state.current_term {
+                persistent.state.current_term = req.term;
+                persistent.state.voted_for = None;
+                *raft.raft_state.write().await = RaftState::Follower;
+                debug!("change_to_follower");
+                if let Err(e) = persistent.save().await {
+                    error!("{e}");
+                    exit(1);
+                }
+            }
             TypedRequestVoteResponse {
                 term: req.term,
                 vote_granted: persistent
@@ -888,6 +907,7 @@ impl<
         &self,
         req: Request<AppendEntriesRequest>,
     ) -> Result<Response<AppendEntriesResponse>, tonic::Status> {
+        debug!("append_entries");
         let req = req.into_inner();
         let req: TypedAppendEntriesRequest = req.into();
         Ok(Response::new(
@@ -901,6 +921,7 @@ impl<
         &self,
         req: Request<RequestVoteRequest>,
     ) -> Result<Response<RequestVoteResponse>, tonic::Status> {
+        debug!("req_vote {:?}", req);
         let req = req.into_inner();
         let req: TypedRequestVoteRequest = req.into();
         Ok(Response::new(

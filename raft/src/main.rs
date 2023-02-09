@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 struct Opts {
     addr: SocketAddr,
-    #[clap(long, default_value = "300ms")]
+    #[clap(long, default_value = "1000ms")]
     heatbeat: ClapDuration,
     election_timeout: Option<ClapDuration>,
     #[clap(short, long)]
