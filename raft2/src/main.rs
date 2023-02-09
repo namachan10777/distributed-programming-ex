@@ -1,7 +1,10 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use clap::Parser;
-use raft::{append_entries, launch, request_vote, AppendEntriesRequest, RequestVoteRequest, State};
+use raft::{
+    append_entries, get_log, launch, post_log, request_vote, AppendEntriesRequest,
+    RequestVoteRequest, State,
+};
 use reqwest::StatusCode;
 use tokio::fs;
 use tracing_subscriber::EnvFilter;
@@ -28,16 +31,13 @@ async fn main() -> anyhow::Result<()> {
     let servers = fs::read_to_string(opts.servers).await?;
     let servers = serde_json::from_str(&servers)?;
     let state = Arc::new(State::from_file(format!("{addr}.json"), addr, servers).await?);
-    launch(
-        state.clone(),
-        Duration::from_millis(1000),
-        Duration::from_millis(300),
-    )
-    .await;
+    let timeout = Duration::from_millis(1000);
+    let heatbeat = Duration::from_millis(300);
+    launch(state.clone(), timeout, heatbeat).await;
     let state = warp::any().map(move || state.clone());
-    let append_entries = warp::path!("append_entries")
+    let append_entries = warp::path!("api" / "log")
         .and(state.clone())
-        .and(warp::post())
+        .and(warp::put())
         .and(warp::body::json::<AppendEntriesRequest>())
         .then(|state, req| async move {
             match append_entries(state, req).await {
@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
                 ),
             }
         });
-    let request_vote = warp::path!("request_vote")
+    let request_vote = warp::path!("api" / "vote")
         .and(state.clone())
         .and(warp::post())
         .and(warp::body::json::<RequestVoteRequest>())
@@ -61,6 +61,25 @@ async fn main() -> anyhow::Result<()> {
                 ),
             }
         });
-    warp::serve(append_entries.or(request_vote)).run(addr).await;
+    let post_log = warp::path!("log")
+        .and(state.clone())
+        .and(warp::post())
+        .and(warp::body::json::<Vec<String>>())
+        .then(move |state, logs| async move {
+            match post_log(state, logs, timeout).await {
+                Ok(res) => warp::reply::with_status(warp::reply::json(&res), StatusCode::OK),
+                Err(e) => warp::reply::with_status(
+                    warp::reply::json(&e.to_string()),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                ),
+            }
+        });
+    let get_log = warp::path!("log")
+        .and(state.clone())
+        .and(warp::get())
+        .then(|state| async move { warp::reply::json(&get_log(state).await) });
+    warp::serve(append_entries.or(request_vote).or(post_log).or(get_log))
+        .run(addr)
+        .await;
     Ok(())
 }

@@ -1,5 +1,5 @@
-
 use futures::future::join_all;
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -20,9 +20,9 @@ use tokio::{
 use tracing::{debug, info, log::trace, warn};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-struct Log {
-    text: String,
-    term: u64,
+pub struct Log {
+    pub text: String,
+    pub term: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -54,6 +54,7 @@ impl VariableState {
     async fn save_persistent(&mut self) -> anyhow::Result<()> {
         let s = serde_json::to_string_pretty(&self.persistent)?;
         self.file.seek(std::io::SeekFrom::Start(0)).await?;
+        self.file.set_len(s.bytes().len() as u64).await?;
         self.file.write_all(s.as_bytes()).await?;
         Ok(())
     }
@@ -172,17 +173,29 @@ pub struct RequestVoteResponse {
 }
 
 #[async_recursion::async_recursion]
-async fn send_append_entries(state: Arc<State>, timeout: Duration) -> anyhow::Result<()> {
+async fn send_append_entries(state: Arc<State>, timeout: Duration) -> anyhow::Result<bool> {
     info!("send_append_entries");
     let responses = join_all(state.servers.iter().map(|addr| {
         let state = state.clone();
         async move {
             let shared = state.state.read().await;
+
             let Role::Leader {
                 next_index,
-                ..
+                match_index,
             } = &shared.role
             else { return Ok(true) };
+            if *addr == state.me {
+                next_index
+                    .write()
+                    .await
+                    .insert(state.me, shared.persistent.logs.len());
+                match_index
+                    .write()
+                    .await
+                    .insert(state.me, shared.persistent.logs.len() - 1);
+                return Ok(true);
+            }
             let prev_log_index = next_index
                 .write()
                 .await
@@ -213,7 +226,7 @@ async fn send_append_entries(state: Arc<State>, timeout: Duration) -> anyhow::Re
             drop(shared);
 
             let res = reqwest::Client::new()
-                .post(format!("http://{addr}/append_entries"))
+                .put(format!("http://{addr}/api/log"))
                 .timeout(timeout / 3)
                 .json(&req)
                 .send()
@@ -238,7 +251,7 @@ async fn send_append_entries(state: Arc<State>, timeout: Duration) -> anyhow::Re
                 match_index
                     .write()
                     .await
-                    .insert(*addr, shared.persistent.logs.len());
+                    .insert(*addr, shared.persistent.logs.len() - 1);
             } else {
                 next_index
                     .write()
@@ -257,13 +270,20 @@ async fn send_append_entries(state: Arc<State>, timeout: Duration) -> anyhow::Re
     for res in &responses {
         debug!(res = format!("{res:?}"), "response");
     }
-    if responses.into_iter().all(|res| res.unwrap_or(false)) {
+    let success_count = responses
+        .into_iter()
+        .filter(|res| if let Ok(b) = res { *b } else { false })
+        .count();
+    // 過半数が成功
+    if success_count * 2 > state.servers.len() {
+        let mut shared = state.state.write().await;
+        shared.commit_index = shared.persistent.logs.len() - 1;
         info!("exit_append_entries");
-        Ok(())
+        Ok(true)
     } else {
         //tokio::spawn(send_append_entries(state.clone(), timeout));
         info!("retry_append_entries");
-        Ok(())
+        Ok(false)
     }
 }
 
@@ -281,7 +301,6 @@ async fn open_election(
     if rx.try_recv().is_ok() {
         return Ok(());
     }
-    dbg!(&state.state);
     let mut shared = state.state.write().await;
     if !shared.role.is_follower() {
         debug!("i_am_not_follower");
@@ -301,7 +320,7 @@ async fn open_election(
                 return Ok(true);
             }
             let granted = reqwest::Client::new()
-                .post(format!("http://{addr}/request_vote"))
+                .post(format!("http://{addr}/api/vote"))
                 .timeout(timeout / 3)
                 .json(&RequestVoteRequest {
                     term: shared.persistent.current_term,
@@ -408,8 +427,39 @@ async fn putoff_timeout(state: &State) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn post_log(_state: Arc<State>, _logs: Vec<String>) -> anyhow::Result<()> {
-    unimplemented!()
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct GetLogResponse {
+    commited: Vec<Log>,
+    all: Vec<Log>,
+}
+
+pub async fn get_log(state: Arc<State>) -> GetLogResponse {
+    let shared = state.state.read().await;
+    let logs = &shared.persistent.logs;
+    GetLogResponse {
+        commited: logs.get(0..shared.commit_index + 1).unwrap_or(&[]).to_vec(),
+        all: logs.clone(),
+    }
+}
+
+pub async fn post_log(
+    state: Arc<State>,
+    logs: Vec<String>,
+    timeout: Duration,
+) -> anyhow::Result<bool> {
+    {
+        let mut shared = state.state.write().await;
+        let mut logs = logs
+            .into_iter()
+            .map(|text| Log {
+                term: shared.persistent.current_term,
+                text,
+            })
+            .collect_vec();
+        shared.persistent.logs.append(&mut logs);
+        shared.save_persistent().await?;
+    }
+    send_append_entries(state.clone(), timeout).await
 }
 
 pub async fn append_entries(
@@ -418,7 +468,7 @@ pub async fn append_entries(
 ) -> anyhow::Result<AppendEntriesResponse> {
     let mut shared = state.state.write().await;
     if req.term < shared.persistent.current_term {
-        debug!("deny_append_entry_by_term");
+        debug!(by = "term", "deny_append_entry");
         return Ok(AppendEntriesResponse { success: false });
     }
     putoff_timeout(&state).await?;
@@ -426,21 +476,28 @@ pub async fn append_entries(
         shared.role = Role::Follower;
         shared.persistent.voted_for = None;
     }
+    if !shared.role.is_follower() {
+        debug!(by = "role", "deny_append_entry");
+        return Ok(AppendEntriesResponse { success: false });
+    }
     if req.prev_log_index >= shared.persistent.logs.len()
         || shared.persistent.logs[req.prev_log_index].term != req.prev_log_term
     {
         debug!(
+            by = "conflicting",
             logs = format!("{:?}", shared.persistent.logs),
             prev_log_index = req.prev_log_index,
             prev_log_term = req.prev_log_term,
-            "deny_append_entry_by_conflicting"
+            "deny_append_entry"
         );
         return Ok(AppendEntriesResponse { success: false });
     }
-    shared.persistent.logs.resize_with(
-        req.prev_log_index + 1 + req.entries.len(),
-        || unreachable!(),
-    );
+    if shared.persistent.logs.len() > req.prev_log_index + 1 + req.entries.len() {
+        shared.persistent.logs.resize_with(
+            req.prev_log_index + 1 + req.entries.len(),
+            || unreachable!(),
+        );
+    }
     for (offset, log) in req.entries.into_iter().enumerate() {
         shared
             .persistent
