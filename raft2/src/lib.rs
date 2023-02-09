@@ -1,3 +1,4 @@
+use anyhow::ensure;
 use futures::future::join_all;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -38,7 +39,6 @@ struct VariableState {
     file: fs::File,
     persistent: Persistent,
     commit_index: usize,
-    last_applied: usize,
 }
 
 #[derive(Debug)]
@@ -84,7 +84,6 @@ impl State {
                 state: RwLock::new(VariableState {
                     persistent: (persistent),
                     commit_index: (0),
-                    last_applied: (0),
                     role: (Role::Follower),
                     file: (file),
                 }),
@@ -108,7 +107,6 @@ impl State {
                 state: RwLock::new(VariableState {
                     persistent: (persistent),
                     commit_index: (0),
-                    last_applied: (0),
                     role: (Role::Follower),
                     file: (file),
                 }),
@@ -381,6 +379,9 @@ async fn open_election(
         let state = state.clone();
         tokio::spawn(async move {
             loop {
+                if !state.state.read().await.role.is_leader() {
+                    break;
+                }
                 let now = Instant::now();
                 if let Err(e) = send_append_entries(state.clone(), timeout).await {
                     warn!("{e}");
@@ -449,6 +450,7 @@ pub async fn post_log(
 ) -> anyhow::Result<bool> {
     {
         let mut shared = state.state.write().await;
+        ensure!(shared.role.is_leader(), "i_am_not_leader");
         let mut logs = logs
             .into_iter()
             .map(|text| Log {
@@ -473,8 +475,11 @@ pub async fn append_entries(
     }
     putoff_timeout(&state).await?;
     if req.term > shared.persistent.current_term {
+        info!("turn_to_follower");
         shared.role = Role::Follower;
+        shared.persistent.current_term = req.term;
         shared.persistent.voted_for = None;
+        shared.save_persistent().await?;
     }
     if !shared.role.is_follower() {
         debug!(by = "role", "deny_append_entry");
@@ -507,6 +512,7 @@ pub async fn append_entries(
     if req.leader_commit > shared.commit_index {
         shared.commit_index = req.leader_commit.min(shared.persistent.logs.len() - 1);
     }
+    debug!(logs = format!("{:?}", shared.persistent.logs), "saved_log");
     shared.save_persistent().await?;
     Ok(AppendEntriesResponse { success: true })
 }
@@ -517,6 +523,7 @@ pub async fn request_vote(
 ) -> anyhow::Result<RequestVoteResponse> {
     info!("try_request_vote");
     let mut shared = state.state.write().await;
+    // 古いタームからの投票要求は拒否
     if req.term < shared.persistent.current_term {
         info!("deny_request_vote");
         return Ok(RequestVoteResponse {
@@ -524,22 +531,60 @@ pub async fn request_vote(
             vote_granted: false,
         });
     }
+
+    // 自身のタームが古い場合はFollowerに戻る
     if req.term > shared.persistent.current_term {
+        info!(by = "vote", "turn_to_follower");
         shared.role = Role::Follower;
+        shared.persistent.current_term = req.term;
+        // 投票も無効なのでリセット
+        shared.persistent.voted_for = None;
+        shared.save_persistent().await?;
     }
+
+    // logに関する投票可否
+    // 最新のlogのタームが相手の方が新しければ投票可能
+    // どちらも同じ場合は投票しても良い
+    let log_condition = req.last_log_term
+        > shared
+            .persistent
+            .logs
+            .last()
+            .map(|log| log.term)
+            .unwrap_or(0)
+        || req.last_log_index + 1 >= shared.persistent.logs.len();
+
+    // ログにより投票不可なら拒否
+    if !log_condition {
+        if Some(req.candidate_id) == shared.persistent.voted_for {
+            shared.persistent.voted_for = None;
+            shared.save_persistent().await?;
+        }
+        return Ok(RequestVoteResponse {
+            term: req.term.max(shared.persistent.current_term),
+            vote_granted: false,
+        });
+    }
+
+    // 既に投票していた場合は投票不可
     let vote_granted = shared
         .persistent
         .voted_for
         .map(|candidate| candidate == req.candidate_id)
         .unwrap_or(true);
+
+    // 投票可能なら投票先を保存
+    // 投票が有効なのでAppendEntriesのタイムアウトも延期する
+    // ↑元論文にはない
     if vote_granted {
         putoff_timeout(&state).await?;
+        shared.persistent.voted_for = Some(req.candidate_id);
+        shared.save_persistent().await?;
     }
-    shared.persistent.voted_for = Some(req.candidate_id);
-    shared.save_persistent().await?;
+
     info!("finish_request_vote");
     Ok(RequestVoteResponse {
-        term: req.term,
+        term: req.term.max(shared.persistent.current_term),
         vote_granted,
     })
 }
