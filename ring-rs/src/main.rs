@@ -77,6 +77,9 @@ impl Ring {
         let connection = self.connection.clone();
         let member_cache = self.ring_cache.read().await.clone();
         let me = self.me;
+        if !self.am_i_coordinator(&addresses, self.me) {
+            self.am_i_coordinator.write().await = false;
+        }
         tokio::spawn(async move {
             if let Ok(mut client) =
                 RingClient::connect(format!("http://{}", connection.read().await.prev)).await

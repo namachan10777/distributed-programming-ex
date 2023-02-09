@@ -8,9 +8,9 @@ document(|
   en = false;
   id = 202013553;
   faculty = {情報};
-  title = {Raft};
+  title = {分散ファイルシステム};
 |) '<
-  +chapter?:(`raft`) ?:(`raft`) ?:(3) {Raft}<
+  +chapter ?:(`distfs`) ?:(`distfs`) ?:(2) {分散ファイルシステム}<
     +section{設計}<
     >
     +section{実装}<

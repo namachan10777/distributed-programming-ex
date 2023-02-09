@@ -1,1 +1,3 @@
 target/
+*.satysfi-aux
+*.pdf
