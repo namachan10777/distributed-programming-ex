@@ -121,7 +121,27 @@ document(|
         複数のノードが同時にダウンするシナリオでもほとんどの場合正常な回復が
         行われるが、再起動と同時ダウンが頻発するシナリオでは
         経路回復に失敗しリングが分断されるケースがあった。
+        安定状態からリーダーがクラッシュ、その後回復するもフォロワーが2ノードクラッシュするシナリオの実験を行った。
+        \enumerate {
+          * \ref-fig(`stable`);
+          * \ref-fig(`leader-crash`);
+          * \ref-fig(`recover`);
+          * \ref-fig(`2-crash`);
+        }
+        経路表からの復元及びリーダーの再選挙に成功していることが確認できる。
       }
+      +figure-here ?:(`stable`) {安定状態} <
+        +centered-pdf(12cm)(`img/stable.pdf`)(1);
+      >
+      +figure-here ?:(`leader-crash`) {\ref-fig(`stable`);後にリーダーのクラッシュ。回復を行っている} <
+        +centered-pdf(12cm)(`img/leader-crash.pdf`)(1);
+      >
+      +figure-here ?:(`recover`) {\ref-fig(`leader-crash`);後にリーダーが再参加} <
+        +centered-pdf(12cm)(`img/recovered.pdf`)(1);
+      >
+      +figure-here ?:(`2-crash`) {\ref-fig(`recover`);後にフォロワーが二つ同時にクラッシュし回復} <
+        +centered-pdf(12cm)(`img/2-crash.pdf`)(1);
+      >
     >
     +section{議論}<
       +p{
