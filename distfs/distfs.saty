@@ -1,6 +1,15 @@
 @require: coins/report
 @require: enumitem/enumitem
+@require: bibyfi/bibyfi
+@require: bibyfi/bibyfi-IEEETran
+@import: ../bib
 
+let bibyfi-theme = BiByFiIEEETran.theme (|
+    name-shrink = false;
+    et-al = false;
+    journal-abbr = [(`European Association for Signal Processing`, `EUSIPCO`)];
+  |)
+in
 open EnumitemAlias in
 document(|
   author = {Masaki Nakano};
@@ -106,6 +115,9 @@ document(|
         実装後に9Pプロトコルを思い出した。
         こちらで実装した方が簡潔であるし、fuse以外でも利用出来て便利だったと思う。
       }
+    >
+    +appendix {参考文献} <
+      +makebibliography ?:(|sort-references=true; citestyle=CiteAsNumber; name-shrink=false;|) (bibyfi-theme)(bibs);
     >
   >
 >

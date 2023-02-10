@@ -1,6 +1,15 @@
 @require: coins/report
 @require: enumitem/enumitem
+@require: bibyfi/bibyfi
+@require: bibyfi/bibyfi-IEEETran
+@import: ../bib
 
+let bibyfi-theme = BiByFiIEEETran.theme (|
+    name-shrink = false;
+    et-al = false;
+    journal-abbr = [(`European Association for Signal Processing`, `EUSIPCO`)];
+  |)
+in
 open EnumitemAlias in
 document(|
   author = {Masaki Nakano};
@@ -82,8 +91,8 @@ document(|
     >
     +section{実装}<
       +p{
-        当初は実装言語に\code(`C`);、RPCに\code(`mochi-margo`);を用いたが、
-        途中で\code(`Rust`);と\code(`gRPC`);による実装に切り替えた。
+        当初は実装言語に\code(`C`);、RPCに\code(`mochi-margo`);\cite[`mochi-margo`];を用いたが、
+        途中で\code(`Rust`);と\code(`gRPC`);\cite[`grpc`];による実装に切り替えた。
       }
       +p{
         RPCを並行して処理するためマルチスレッドでの処理を行い、
@@ -93,7 +102,7 @@ document(|
       +p{
         リーダーからの生存報告のタイムアウトには一定時間毎に\code(`list`); RPCの報告を受け取らない限り
         自動的にリーダー再選出を開始するスレッドを用意し、それを\code(`list`); RPCを受けた時点で解除することで
-        実装した。非同期ランタイムライブラリの\code(`tokio`);には
+        実装した。非同期ランタイムライブラリの\code(`tokio`);\cite[`tokio`];には
         複数の非同期タスクのうち最も早く終了したタスクの結果をとる\code(`select!`);マクロがあるため、
         これを用い単純なスリープである\code(`tokio::time::sleep()`);
         とスレッド間通信を行う\code(`tokio::sync::mpsc::Reciever`);
@@ -145,6 +154,9 @@ document(|
         結果スタックトレースでもデバッガでも大量のランタイムコードが走るスレッドプールの中に処理が分散し、
         デバッグが困難となった。
       }
+    >
+    +appendix {参考文献} <
+      +makebibliography ?:(|sort-references=true; citestyle=CiteAsNumber; name-shrink=false;|) (bibyfi-theme)(bibs);
     >
   >
 >

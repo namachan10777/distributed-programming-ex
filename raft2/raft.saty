@@ -1,6 +1,15 @@
 @require: coins/report
 @require: enumitem/enumitem
+@require: bibyfi/bibyfi
+@require: bibyfi/bibyfi-IEEETran
+@import: ../bib
 
+let bibyfi-theme = BiByFiIEEETran.theme (|
+    name-shrink = false;
+    et-al = false;
+    journal-abbr = [(`European Association for Signal Processing`, `EUSIPCO`)];
+  |)
+in
 open EnumitemAlias in
 document(|
   author = {Masaki Nakano};
@@ -13,13 +22,13 @@ document(|
   +chapter?:(`raft`) ?:(`raft`) ?:(3) {Raft}<
     +section{概要}<
       +p{
-        Raftは分散合意プロトコルであり、理解しやすく実用的で複数ノードでステートマシンへの
+        Raft\cite[`ongaro2014raft`];は分散合意プロトコルであり、理解しやすく実用的で複数ノードでステートマシンへの
         コマンド列の同期を取ることを目的としている。
       }
       +p{
-        Raft以前にはLamportらにより提案されたPaxosアルゴリズムが広く利用されていたが、
+        Raft以前にはLamportらにより提案されたPaxosアルゴリズム\cite[`lamport1998paxos`];が広く利用されていたが、
         Paxosは難解であり実装及び理解が難しく、
-        基本プロトコルは実用的でないためMulti-Paxosと呼ばれる複数のPaxosインスタンスの組み合わせを用いるが、
+        基本プロトコルは実用的でないためMulti-Paxos\cite[`chandra2007paxos`];と呼ばれる複数のPaxosインスタンスの組み合わせを用いるが、
         これに広く合意されたアルゴリズムがない事を筆者らは問題であると主張している。
         また、PaxosはP2Pにより合意を取っていくが
         現実的にはリーダを選出した方が単純であり高速に動作すると主張している。
@@ -148,6 +157,9 @@ document(|
         今回は単純な実装であるしテストも簡易的なものしか実施していないが、
         実装自体は抽象化しやすそうであるので抽象化した上でファジングテストを実施しライブラリとして利用出来るようにしたい。
       }
+    >
+    +appendix {参考文献} <
+      +makebibliography ?:(|sort-references=true; citestyle=CiteAsNumber; name-shrink=false;|) (bibyfi-theme)(bibs);
     >
   >
 >

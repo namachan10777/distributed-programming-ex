@@ -1,0 +1,50 @@
+@require: bibyfi/bibyfi
+@require: coins/report
+
+let bibs = [
+  (`ongaro2014raft`, InProceedings(|
+    address = Some(`USA`);
+    author = [`Diego Ongaro`; `John Ousterhout`];
+    booktitle = `Proceedings of the 2014 USENIX Conference on USENIX Annual Technical Conference`;
+    editor = None;
+    key = None;
+    month = None;
+    note = None;
+    organization = None;
+    pages = Some((`305`,`320`));
+    publisher = Some(`USENIX Association`);
+    title = `In search of an understandable consensus algorithm`;
+    year = `2014`;
+  |));
+  (`lamport1998paxos`, Article(|
+    author = [`Leslie Lamport`];
+    journal = `ACM Trans. Comput. Syst.`;
+    key = None;
+    month = None;
+    note = None;
+    number = Some(`2`);
+    pages = (`133`, `169`);
+    title = `The Part-Time Parliament`;
+    volume = Some(`16`);
+    year = `1998`;
+  |));
+  (`chandra2007paxos`, InProceedings(|
+    address = None;
+    author = [`Tushar Deepak Chandra`; `Robert Griesemer`; `Joshua Redstone`];
+    booktitle = `Proceedings of the 26th Annual ACM Symposium on Principles of Distributed Computing`;
+    editor = None;
+    key = None;
+    month = None;
+    note = None;
+    organization = None;
+    pages = None;
+    publisher = None;
+    title = `Paxos Made Live - An Engineering Perspective (2006 Invited Talk)`;
+    year = `2007`;
+  |));
+  (`tokio`, WildCard {\code(`https://github.com/tokio-rs/tokio`);});
+  (`mochi-margo`, WildCard {\code(`https://github.com/mochi-hpc/mochi-margo`);});
+  (`fuse`, WildCard {\code(`https://github.com/libfuse/libfuse`);});
+  (`fuse3`, WildCard {\code(`https://github.com/Sherlock-Holo/fuse3`);});
+  (`grpc`, WildCard {\code(`https://grpc.io/`);});
+]
