@@ -41,8 +41,8 @@ use crate::{
 use super::proto;
 pub struct Server {
     root_path: PathBuf,
-    fh: RwLock<HashMap<u64, (tokio::fs::File, std::path::PathBuf)>>,
-    dh: RwLock<HashMap<u64, (Vec<readdir_response::Entry>, std::path::PathBuf)>>,
+    fh: RwLock<HashMap<u64, RwLock<(tokio::fs::File, std::path::PathBuf)>>>,
+    dh: RwLock<HashMap<u64, RwLock<(Vec<readdir_response::Entry>, std::path::PathBuf)>>>,
     fh_src: AtomicU64,
 }
 
@@ -184,6 +184,8 @@ impl Server {
                 let lock = self.fh.read().await;
                 let file = lock.get(&fh).ok_or(libc::EEXIST)?;
                 let meta = file
+                    .read()
+                    .await
                     .0
                     .metadata()
                     .await
@@ -226,7 +228,8 @@ impl Server {
         match (path, fh) {
             (_, Some(fh)) => {
                 let lock = self.fh.read().await;
-                let (file, path) = lock.get(&fh).ok_or(libc::EEXIST)?;
+                let lock = lock.get(&fh).ok_or(libc::EEXIST)?;
+                let (file, path) = &*lock.read().await;
                 set_attr_by_path(self.real_path(path), attr)
                     .await
                     .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
@@ -404,7 +407,7 @@ impl Server {
                 }))
                 .collect()
         };
-        self.dh.write().await.insert(fh, (inner, path));
+        self.dh.write().await.insert(fh, RwLock::new((inner, path)));
         Ok((fh, req.flags))
     }
 
@@ -423,7 +426,8 @@ impl Server {
     ) -> Result<Vec<Entry>, libc::c_int> {
         let req = req.into_inner();
         let lock = self.dh.read().await;
-        let (entries, path) = lock.get(&req.fh).ok_or(libc::EEXIST)?;
+        let lock = lock.get(&req.fh).ok_or(libc::EEXIST)?;
+        let (entries, path) = &*lock.read().await;
         debug!(
             offset = req.offset,
             path = path.to_string_lossy().to_string(),
@@ -462,15 +466,16 @@ impl Server {
                 e.raw_os_error().unwrap_or(libc::EACCES)
             })?;
         let fh = self.alloc_fh();
-        self.fh.write().await.insert(fh, (file, path));
+        self.fh.write().await.insert(fh, RwLock::new((file, path)));
         Ok((fh, req.flags))
     }
 
     async fn read_impl(&self, req: tonic::Request<ReadRequest>) -> Result<Vec<u8>, libc::c_int> {
         let req = req.into_inner();
 
-        let mut lock = self.fh.write().await;
-        let (file, path) = lock.get_mut(&req.fh).ok_or(libc::EEXIST)?;
+        let lock = self.fh.read().await;
+        let lock = lock.get(&req.fh).ok_or(libc::EEXIST)?;
+        let (file, path) = &mut *lock.write().await;
         let mut data = vec![0u8; req.size as usize];
 
         debug!(
@@ -512,8 +517,9 @@ impl Server {
 
     async fn write_impl(&self, req: tonic::Request<WriteRequest>) -> Result<u32, libc::c_int> {
         let req = req.into_inner();
-        let mut lock = self.fh.write().await;
-        let (file, path) = lock.get_mut(&req.fh).ok_or(libc::EEXIST)?;
+        let lock = self.fh.read().await;
+        let lock = lock.get(&req.fh).ok_or(libc::EEXIST)?;
+        let (file, path) = &mut *lock.write().await;
         debug!(path = path.to_string_lossy().to_string(), "write");
         file.seek(io::SeekFrom::Start(req.offset))
             .await
@@ -529,10 +535,10 @@ impl Server {
         let req = req.into_inner();
         let fh = req.fh;
         let mut lock = self.fh.write().await;
-        let file = lock.remove(&fh);
-        if let Some((mut file, _)) = file {
+        let lock = lock.remove(&fh);
+        if let Some(lock) = lock {
             if req.flush {
-                file.flush()
+                lock.write().await.0.flush()
                     .await
                     .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
             }
@@ -554,11 +560,11 @@ impl Server {
 
     async fn flush_impl(&self, req: tonic::Request<FlushRequest>) -> Result<(), libc::c_int> {
         let req = req.into_inner();
-        let mut lock = self.fh.write().await;
-        let Some((ref mut file, _)) = lock.get_mut(&req.fh) else {
+        let lock = self.fh.read().await;
+        let Some(lock) = lock.get(&req.fh) else {
             return Err(libc::EEXIST)
         };
-        file.flush()
+        lock.write().await.0.flush()
             .await
             .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
         Ok(())
@@ -566,9 +572,10 @@ impl Server {
 
     async fn fsync_impl(&self, req: tonic::Request<FsyncRequest>) -> Result<(), libc::c_int> {
         let req = req.into_inner();
-        let mut lock = self.fh.write().await;
-        let (file, _) = lock.get_mut(&req.fh).ok_or(libc::EEXIST)?;
-        file.flush()
+        let lock = self.fh.read().await;
+        let lock = lock.get(&req.fh).ok_or(libc::EEXIST)?;
+        let (file, _) = &mut *lock.write().await;
+        lock.write().await.0.flush()
             .await
             .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
         fsync(file.as_raw_fd()).map_err(|e| e as libc::c_int)?;
@@ -599,7 +606,7 @@ impl Server {
             .metadata()
             .await
             .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;
-        self.fh.write().await.insert(fh, (file, path));
+        self.fh.write().await.insert(fh, RwLock::new((file, path)));
         Ok(create_response::Ok {
             fh,
             ttl_ms: 1000,
@@ -614,8 +621,9 @@ impl Server {
         req: tonic::Request<FallocateRequest>,
     ) -> Result<(), libc::c_int> {
         let req = req.into_inner();
-        let lock = self.fh.write().await;
-        let (file, _) = lock.get(&req.fh).ok_or(libc::EEXIST)?;
+        let lock = self.fh.read().await;
+        let lock = lock.get(&req.fh).ok_or(libc::EEXIST)?;
+        let (file, _) = &mut *lock.write().await;
         fallocate(
             file.as_raw_fd(),
             FallocateFlags::from_bits(req.mode as i32).ok_or(libc::EINVAL)?,
@@ -628,8 +636,9 @@ impl Server {
 
     async fn lseek_impl(&self, req: tonic::Request<LseekRequest>) -> Result<u64, libc::c_int> {
         let req = req.into_inner();
-        let mut lock = self.fh.write().await;
-        let (file, _) = lock.get_mut(&req.fh).ok_or(libc::EEXIST)?;
+        let lock = self.fh.read().await;
+        let lock = lock.get(&req.fh).ok_or(libc::EEXIST)?;
+        let (file, _) = &mut *lock.write().await;
         let seek = match req.whence as i32 {
             libc::SEEK_SET => file.seek(SeekFrom::Start(req.offset)).await,
             libc::SEEK_CUR => file.seek(SeekFrom::Current(req.offset as i64)).await,
@@ -656,11 +665,12 @@ impl Server {
         req: tonic::Request<CopyFileRangeRequest>,
     ) -> Result<u64, libc::c_int> {
         let req = req.into_inner();
-        let mut lock = self.fh.write().await;
-        let [(file_in, _), (file_out, _)] = lock
-            .get_many_mut([&req.fh_in, &req.fh_out])
-            .ok_or(libc::EEXIST)?;
-        file_in
+        let lock = self.fh.read().await;
+        let file_in = lock.get(&req.fh_in).ok_or(libc::EEXIST)?;
+        let (file_in, _) = &mut *file_in.write().await;
+        let file_out = lock.get(&req.fh_out).ok_or(libc::EEXIST)?;
+        let (file_out, _) = &mut *file_out.write().await;
+        file_out
             .flush()
             .await
             .map_err(|e| e.raw_os_error().unwrap_or(libc::EACCES))?;

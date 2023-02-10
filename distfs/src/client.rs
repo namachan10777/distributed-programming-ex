@@ -2,43 +2,46 @@
 
 use std::{
     ffi::{CString, OsStr, OsString},
-    sync::Arc,
+    num::NonZeroUsize,
     time::Duration,
 };
 
 use fuse3::{path::prelude::*, Errno};
-use tokio::sync::Mutex;
-use tonic::transport::Channel;
+use futures::StreamExt;
+use tonic::transport::{Channel, Uri};
 use tracing::{debug, warn};
 
 use crate::{
-    proto::{
-        self,
-        fs::{
-            attr_response, copy_file_range_response, create_response,
-            filesystem_client::FilesystemClient, handle_response, lseek_response, read_response,
-            readdir_response, readlink_response, unit_response, write_response, AccessRequest,
-            CopyFileRangeRequest, CreateRequest, FallocateRequest, FlushRequest, FsyncRequest,
-            GetAttrRequest, LookupRequest, LseekRequest, MkdirRequest, OpenRequest, OpendirRequest,
-            ReadRequest, ReaddirRequest, ReadlinkRequest, ReleaseRequest,
-            ReleasedirRequest, RenameRequest, RmdirRequest, SetAttrRequest, SymlinkRequest,
-            UnlinkRequest, WriteRequest,
-        },
+    mux,
+    proto::fs::{
+        attr_response, copy_file_range_response, create_response,
+        filesystem_client::{self},
+        handle_response, lseek_response, read_response, readdir_response, readlink_response,
+        unit_response, write_response, AccessRequest, CopyFileRangeRequest, CreateRequest,
+        FallocateRequest, FlushRequest, FsyncRequest, GetAttrRequest, LookupRequest, LseekRequest,
+        MkdirRequest, OpenRequest, OpendirRequest, ReadRequest, ReaddirRequest, ReadlinkRequest,
+        ReleaseRequest, ReleasedirRequest, RenameRequest, RmdirRequest, SetAttrRequest,
+        SymlinkRequest, UnlinkRequest, WriteRequest,
     },
     type_conv,
 };
 
 pub struct Distfs {
-    client: Arc<Mutex<proto::fs::filesystem_client::FilesystemClient<Channel>>>,
+    client: mux::Pool<filesystem_client::FilesystemClient<Channel>>,
 }
 
 impl Distfs {
-    pub async fn new(
-        grpc_endpoint: tonic::transport::Uri,
-    ) -> Result<Self, tonic::transport::Error> {
-        let client = FilesystemClient::connect(grpc_endpoint.clone()).await?;
-        let client = Arc::new(Mutex::new(client));
-        Ok(Distfs { client })
+    pub async fn new(uri: Uri, replica: NonZeroUsize) -> Result<Self, tonic::transport::Error> {
+        let client = mux::Pool::new(
+            futures::stream::iter(0..replica.get())
+                .then(|_| filesystem_client::FilesystemClient::connect(uri.clone()))
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<Result<_, _>>()?,
+        )
+        .await;
+        Ok(Self { client })
     }
 }
 
@@ -60,7 +63,7 @@ impl PathFilesystem for Distfs {
     ) -> fuse3::Result<ReplyEntry> {
         let lookup = self
             .client
-            .lock()
+            .get()
             .await
             .lookup(LookupRequest {
                 parent: parent.to_string_lossy().to_string(),
@@ -92,7 +95,7 @@ impl PathFilesystem for Distfs {
     ) -> fuse3::Result<ReplyAttr> {
         let get_attr = self
             .client
-            .lock()
+            .get()
             .await
             .get_attr(GetAttrRequest {
                 path: path.map(|path| path.to_string_lossy().to_string()),
@@ -127,7 +130,7 @@ impl PathFilesystem for Distfs {
     ) -> fuse3::Result<ReplyAttr> {
         let set_attr = self
             .client
-            .lock()
+            .get()
             .await
             .set_attr(SetAttrRequest {
                 path: path.map(|s| s.to_string_lossy().to_string()),
@@ -163,7 +166,7 @@ impl PathFilesystem for Distfs {
     ) -> fuse3::Result<ReplyEntry> {
         let set_attr = self
             .client
-            .lock()
+            .get()
             .await
             .mkdir(MkdirRequest {
                 parent: parent.to_string_lossy().to_string(),
@@ -193,7 +196,7 @@ impl PathFilesystem for Distfs {
     async fn unlink(&self, _req: Request, parent: &OsStr, name: &OsStr) -> fuse3::Result<()> {
         let unlink = self
             .client
-            .lock()
+            .get()
             .await
             .unlink(UnlinkRequest {
                 parent: parent.to_string_lossy().to_string(),
@@ -214,7 +217,7 @@ impl PathFilesystem for Distfs {
         warn!("readlink");
         let res = self
             .client
-            .lock()
+            .get()
             .await
             .readlink(ReadlinkRequest {
                 path: path.to_string_lossy().to_string(),
@@ -243,7 +246,7 @@ impl PathFilesystem for Distfs {
     ) -> fuse3::Result<ReplyEntry> {
         let symlink = self
             .client
-            .lock()
+            .get()
             .await
             .symlink(SymlinkRequest {
                 parent: parent.to_string_lossy().to_string(),
@@ -272,7 +275,7 @@ impl PathFilesystem for Distfs {
     async fn rmdir(&self, _req: Request, parent: &OsStr, name: &OsStr) -> fuse3::Result<()> {
         let rmdir = self
             .client
-            .lock()
+            .get()
             .await
             .rmdir(RmdirRequest {
                 parent: parent.to_string_lossy().to_string(),
@@ -308,7 +311,7 @@ impl PathFilesystem for Distfs {
         );
         let opendir = self
             .client
-            .lock()
+            .get()
             .await
             .open(OpenRequest {
                 path: path.to_string_lossy().to_string(),
@@ -336,7 +339,7 @@ impl PathFilesystem for Distfs {
     ) -> fuse3::Result<ReplyData> {
         let read = self
             .client
-            .lock()
+            .get()
             .await
             .read(ReadRequest { fh, offset, size })
             .await
@@ -360,7 +363,7 @@ impl PathFilesystem for Distfs {
     ) -> fuse3::Result<ReplyWrite> {
         let written = self
             .client
-            .lock()
+            .get()
             .await
             .write(WriteRequest {
                 data: data.to_vec(),
@@ -389,7 +392,7 @@ impl PathFilesystem for Distfs {
     ) -> fuse3::Result<()> {
         let res = self
             .client
-            .lock()
+            .get()
             .await
             .release(ReleaseRequest {
                 flush,
@@ -416,7 +419,7 @@ impl PathFilesystem for Distfs {
     ) -> fuse3::Result<()> {
         let res = self
             .client
-            .lock()
+            .get()
             .await
             .fsync(FsyncRequest { fh, datasync })
             .await
@@ -438,7 +441,7 @@ impl PathFilesystem for Distfs {
     ) -> fuse3::Result<()> {
         let res = self
             .client
-            .lock()
+            .get()
             .await
             .flush(FlushRequest { fh, lock_owner })
             .await
@@ -455,7 +458,7 @@ impl PathFilesystem for Distfs {
     async fn access(&self, _req: Request, path: &OsStr, mask: u32) -> fuse3::Result<()> {
         let res = self
             .client
-            .lock()
+            .get()
             .await
             .access(AccessRequest {
                 path: path.to_string_lossy().to_string(),
@@ -483,7 +486,7 @@ impl PathFilesystem for Distfs {
     ) -> fuse3::Result<ReplyCreated> {
         let res = self
             .client
-            .lock()
+            .get()
             .await
             .create(CreateRequest {
                 flags,
@@ -527,7 +530,7 @@ impl PathFilesystem for Distfs {
     ) -> fuse3::Result<()> {
         let res = self
             .client
-            .lock()
+            .get()
             .await
             .fallocate(FallocateRequest {
                 fh,
@@ -550,7 +553,7 @@ impl PathFilesystem for Distfs {
     async fn opendir(&self, _req: Request, path: &OsStr, flags: u32) -> fuse3::Result<ReplyOpen> {
         let opendir = self
             .client
-            .lock()
+            .get()
             .await
             .opendir(OpendirRequest {
                 path: path.to_string_lossy().to_string(),
@@ -578,7 +581,7 @@ impl PathFilesystem for Distfs {
     ) -> fuse3::Result<()> {
         let releasedir = self
             .client
-            .lock()
+            .get()
             .await
             .releasedir(ReleasedirRequest {
                 path: path.to_string_lossy().to_string(),
@@ -607,7 +610,7 @@ impl PathFilesystem for Distfs {
     ) -> fuse3::Result<ReplyDirectoryPlus<Self::DirEntryPlusStream>> {
         let readdir = self
             .client
-            .lock()
+            .get()
             .await
             .readdir(ReaddirRequest {
                 fh,
@@ -661,7 +664,7 @@ impl PathFilesystem for Distfs {
     ) -> fuse3::Result<()> {
         let rename = self
             .client
-            .lock()
+            .get()
             .await
             .rename(RenameRequest {
                 origin_parent: origin_parent.to_string_lossy().to_string(),
@@ -692,7 +695,7 @@ impl PathFilesystem for Distfs {
     ) -> fuse3::Result<ReplyLSeek> {
         let res = self
             .client
-            .lock()
+            .get()
             .await
             .lseek(LseekRequest { fh, offset, whence })
             .await
@@ -719,7 +722,7 @@ impl PathFilesystem for Distfs {
     ) -> fuse3::Result<ReplyCopyFileRange> {
         let res = self
             .client
-            .lock()
+            .get()
             .await
             .copy_file_range(CopyFileRangeRequest {
                 fh_in,

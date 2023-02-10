@@ -2,7 +2,7 @@ use clap::Parser;
 use distfs::proto::fs::filesystem_server::FilesystemServer;
 use fuse3::path::prelude::*;
 use fuse3::MountOptions;
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf};
 use tonic::transport::{Server, Uri};
 use tracing_subscriber::prelude::*;
 
@@ -14,8 +14,15 @@ struct Opts {
 
 #[derive(clap::Parser, Debug)]
 enum SubCommand {
-    Server { target: PathBuf, addr: SocketAddr },
-    Client { uri: Uri, mountpoint: PathBuf },
+    Server {
+        target: PathBuf,
+        addr: SocketAddr,
+    },
+    Client {
+        uri: Uri,
+        mountpoint: PathBuf,
+        replica: Option<NonZeroUsize>,
+    },
 }
 
 #[tokio::main]
@@ -44,9 +51,20 @@ async fn main() -> anyhow::Result<()> {
                 .serve(addr)
                 .await?;
         }
-        SubCommand::Client { uri, mountpoint } => {
+        SubCommand::Client {
+            uri,
+            mountpoint,
+            replica,
+        } => {
             Session::new(mount_options)
-                .mount_with_unprivileged(distfs::client::Distfs::new(uri).await?, mountpoint)
+                .mount_with_unprivileged(
+                    distfs::client::Distfs::new(
+                        uri,
+                        replica.unwrap_or(NonZeroUsize::new(16).unwrap()),
+                    )
+                    .await?,
+                    mountpoint,
+                )
                 .await?
                 .await?;
         }
