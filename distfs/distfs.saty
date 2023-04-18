@@ -22,8 +22,8 @@ document(|
   +chapter ?:(`distfs`) ?:(`distfs`) ?:(2) {分散ファイルシステム}<
     +section{設計}<
       +p{
-        \code(`fuse`);の低レベルプロトコルを\code(`libc`);の関数及び
-        Rustの非同期ランタイムである\code(`tokio`);のファイル操作に対応させる形で実装を行った。
+        \code(`fuse`);\cite[`fuse`];の低レベルプロトコルを\code(`libc`);の関数及び
+        Rustの非同期ランタイムである\code(`tokio`);\cite[`tokio`];のファイル操作に対応させる形で実装を行った。
         クライアント側は\code(`fuse`);の低レベル関数を直接RPCに変換し、
         サーバー側で実際の処理を行なっている。
       }
@@ -45,7 +45,7 @@ document(|
     +section{実装}<
       +p{
         RPCにはgRPCを使った。
-        fuseのライブラリは非同期IOをサポートしていることから\code(`fuse3`);を利用した。
+        fuseのライブラリは非同期IOをサポートしていることから\code(`fuse3`);\cite[`fuse3`];を利用した。
       }
       +listing{
         * \code(`lookup`);
@@ -93,7 +93,21 @@ document(|
         このリポジトリをサーバでルートとして設定し、マウント。
         \code(`fish`);、\code(`sh`);でアクセスし、\code(`coreutils`);で\code(`mkdir`);、\code(`rm`);、\code(`cat`);、リダイレクトによる書き込み、\code(`vim`);による編集をテストした。
         また、\code(`cargo`);により分散ファイルシステム経由で自身のビルドを行った。
+        \ref-fig(`ls-and-attr`);にディレクトリエントリと属性の確認の結果、\ref-fig(`file-edit`);に
+        \code(`cat`);とリダイレクト、\code(`neovim`);による編集の結果を示す。
+        どちらも問題なく動作していることが確認できる。
+        一方でシンボリックリンクの実装はバグがあった。\code(`broken-link`);
+        に示すように正しくシンボリックリンクが貼られていない。
       }
+      +figure-here ?:(`ls-and-attr`) {ディレクトリエントリとファイル属性の確認} <
+        +centered-pdf(12cm)(`img/ls-and-attr.pdf`)(1);
+      >
+      +figure-here ?:(`file-edit`) {ファイル編集} <
+        +centered-pdf(12cm)(`img/file-edit.pdf`)(1);
+      >
+      +figure-here ?:(`broken-link`) {シンボリックリンク(動作しない)} <
+        +centered-pdf(12cm)(`img/broken-link.pdf`)(1);
+      >
     >
     +section{感想}<
       +p{

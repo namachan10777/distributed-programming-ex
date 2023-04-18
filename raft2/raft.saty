@@ -137,7 +137,24 @@ document(|
     +section{動作確認}<
       +p{
         3ノード、5ノードでリーダの就任とログの複製について確認した。
+        3ノードの場合の実験結果を\ref-fig(`stable`);から始まる一連の図として添付する。
+        各図表の右下のターミナルはRESTクライアント用のターミナルであり、ログの確認及び追加を行う。
       }
+      +figure-here ?:(`stable`) {安定状態} <
+        +centered-pdf(12cm)(`img/stable.pdf`)(1);
+      >
+      +figure-here ?:(`log-add`) {\ref-fig(`stable`);後、ログの追加} <
+        +centered-pdf(12cm)(`img/log-add.pdf`)(1);
+      >
+      +figure-here ?:(`lost-disk`) {\ref-fig(`log-add`);後、フォロワーノードがダウン、永続化記憶喪失後復帰} <
+        +centered-pdf(12cm)(`img/lost-disk.pdf`)(1);
+      >
+      +figure-here ?:(`election`) {\ref-fig(`lost-disk`);後、リーダーダウン、再選挙}<
+        +centered-pdf(12cm)(`img/lost-disk.pdf`)(1);
+      >
+      +figure-here ?:(`recover`) {\ref-fig(`election`);後、リーダー再選挙成功}<
+        +centered-pdf(12cm)(`img/recover.pdf`)(1);
+      >
     >
     +section{感想}<
       +p{
